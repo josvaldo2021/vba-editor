@@ -1,0 +1,16 @@
+# Workbooks e dados (NUNCA versionar - grandes e/ou confidenciais)
+*.xlsm
+*.xlsb
+*.xls
+*.accdb
+*.mdb
+
+# Backups gerados pela ferramenta
+backups/
+
+# Temporarios / cache
+__pycache__/
+*.pyc
+.venv/
+venv/
+scratchpad/
