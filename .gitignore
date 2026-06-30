@@ -11,6 +11,28 @@ backups/
 # Temporarios / cache
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
+env/
 scratchpad/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# Sistema operacional
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Saidas de exportacao da ferramenta
+backup_vba/
+*.bas
+*.cls
+*.frm
