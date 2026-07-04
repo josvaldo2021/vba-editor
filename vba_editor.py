@@ -106,12 +106,34 @@ class VBAEditor:
         self.fechar(salvar=exc_type is None)
 
     def abrir(self):
-        self.excel = win32com.client.Dispatch("Excel.Application")
+        self._verificar_lock()
+        # DispatchEx: SEMPRE cria uma instancia nova e isolada do Excel.
+        # Dispatch reaproveitaria uma instancia ja aberta pelo usuario, e o
+        # Quit() do fechar() derrubaria a sessao dele (podendo descartar
+        # trabalho nao salvo).
+        self.excel = win32com.client.DispatchEx("Excel.Application")
         self.excel.Visible = self.visivel
         self.excel.DisplayAlerts = False
         self.wb = self.excel.Workbooks.Open(self.caminho)
         self._verificar_acesso_vbproject()
         return self
+
+    def _verificar_lock(self):
+        """Aborta se o workbook ja estiver aberto no Excel.
+
+        O Excel cria um arquivo de lock '~$<nome>' ao lado do workbook
+        enquanto ele esta aberto. Abrir por cima (mesmo em outra instancia)
+        seria somente-leitura e o salvamento falharia no final.
+        """
+        lock = os.path.join(os.path.dirname(self.caminho),
+                            "~$" + os.path.basename(self.caminho))
+        if os.path.exists(lock):
+            raise RuntimeError(
+                "O workbook parece estar aberto no Excel (existe o lock "
+                f"'{os.path.basename(lock)}'). Feche o Excel e rode novamente. "
+                "Se o Excel nao estiver aberto, o lock e sobra de um "
+                "encerramento anormal: apague o arquivo e tente de novo."
+            )
 
     def _verificar_acesso_vbproject(self):
         try:

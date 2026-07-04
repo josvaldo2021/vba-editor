@@ -26,7 +26,10 @@ python vba_editor.py "workbook.xlsm" adicionar --modulo MeuModulo --tipo std
 python vba_editor.py "workbook.xlsm" remover --modulo MeuModulo
 ```
 
-> Feche o Excel antes de rodar (instâncias abertas travam o arquivo).
+> A ferramenta cria uma instância própria e isolada do Excel (`DispatchEx`) —
+> ela nunca toca numa sessão do Excel que você já tenha aberta. Se o **próprio
+> workbook alvo** estiver aberto, ela aborta com aviso (detecta o lock `~$`);
+> feche-o antes de rodar.
 
 ## Uso como biblioteca
 
