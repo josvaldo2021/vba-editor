@@ -13,6 +13,9 @@ Usa pywin32 (win32com) para controlar o Excel e acessar o VBProject de um arquiv
   - adicionar : criar um modulo novo (standard ou classe)
   - remover   : apagar um modulo
   - listar    : mostrar os modulos existentes
+  - ler       : imprimir o codigo de um modulo (ou de um procedimento)
+  - procurar  : buscar texto em todos os modulos (modulo:linha: trecho)
+  - verificar : compilar o projeto VBA e informar se ha erro
 
 REQUISITOS
 ----------
@@ -32,11 +35,15 @@ EXEMPLOS DE USO (linha de comando)
     python vba_editor.py arquivo.xlsm editar --modulo Module1 --de "ValorAntigo" --para "ValorNovo"
     python vba_editor.py arquivo.xlsm adicionar --modulo MeuModulo --tipo std
     python vba_editor.py arquivo.xlsm remover --modulo MeuModulo
+    python vba_editor.py arquivo.xlsm ler --modulo Module1 --proc MinhaSub
+    python vba_editor.py arquivo.xlsm procurar --texto "tblProgramacao"
+    python vba_editor.py arquivo.xlsm verificar
 """
 
 import os
 import re
 import sys
+import time
 import shutil
 import argparse
 from datetime import datetime
@@ -60,6 +67,10 @@ TIPO_NOME = {
     VBEXT_CT_MSFORM: "UserForm",
     VBEXT_CT_DOCUMENT: "Documento (planilha/workbook)",
 }
+
+# Id do botao 'Depurar > Compilar VBAProject' nos menus do VBE
+# (independe do idioma do Office).
+ID_COMANDO_COMPILAR = 578
 
 
 class VBAEditor:
@@ -278,6 +289,133 @@ class VBAEditor:
         print(f"Procedimento '{nome_proc}' de '{nome_modulo}' substituido "
               f"(linhas {inicio}..{inicio + qtd - 1}).")
 
+    def ler(self, nome_modulo, proc=None, numerar=False):
+        """Imprime (e retorna) o codigo de um modulo ou de um procedimento.
+
+        proc: nome de um Sub/Function do modulo. Atencao: o VBE considera os
+        comentarios imediatamente acima do procedimento como parte dele, entao
+        eles aparecem junto. numerar=True prefixa o numero real de cada linha.
+        """
+        cm = self._achar(nome_modulo).CodeModule
+        if proc:
+            try:
+                inicio = cm.ProcStartLine(proc, 0)  # 0 = vbext_pk_Proc (Sub/Function)
+                qtd = cm.ProcCountLines(proc, 0)
+            except Exception:
+                raise KeyError(
+                    f"Procedimento '{proc}' nao encontrado em '{nome_modulo}'.")
+            codigo = cm.Lines(inicio, qtd)
+            base = inicio
+        else:
+            if cm.CountOfLines == 0:
+                print(f"(modulo '{nome_modulo}' esta vazio)")
+                return ""
+            codigo = cm.Lines(1, cm.CountOfLines)
+            base = 1
+        if numerar:
+            codigo = "\n".join(f"{base + i:5d}  {linha}"
+                               for i, linha in enumerate(codigo.splitlines()))
+        print(codigo)
+        return codigo
+
+    def procurar(self, texto, modulo=None, sensivel=False):
+        """Busca texto no codigo de todos os modulos (ou de apenas um).
+
+        Imprime cada ocorrencia como 'modulo:linha: conteudo' e retorna a
+        lista [(modulo, linha, conteudo), ...]. Por padrao ignora
+        maiusculas/minusculas (como o proprio VBA).
+        """
+        alvo = texto if sensivel else texto.lower()
+        comps = [self._achar(modulo)] if modulo else list(self._componentes)
+        ocorrencias = []
+        modulos_com_match = set()
+        for comp in comps:
+            cm = comp.CodeModule
+            if cm.CountOfLines == 0:
+                continue
+            linhas = cm.Lines(1, cm.CountOfLines).splitlines()
+            for n, linha in enumerate(linhas, start=1):
+                pesquisa = linha if sensivel else linha.lower()
+                if alvo in pesquisa:
+                    ocorrencias.append((comp.Name, n, linha))
+                    modulos_com_match.add(comp.Name)
+                    print(f"{comp.Name}:{n}: {linha.strip()}")
+        if ocorrencias:
+            print(f"\n{len(ocorrencias)} ocorrencia(s) em "
+                  f"{len(modulos_com_match)} modulo(s).")
+        else:
+            print(f"Nenhuma ocorrencia de '{texto}'.")
+        return ocorrencias
+
+    def _controle_compilar(self, vbe):
+        """Localiza o botao 'Compilar' (Id 578) nos menus do VBE.
+
+        Busca pelo Id numerico, que e o mesmo em qualquer idioma do Office
+        (nao depende do menu se chamar 'Debug' ou 'Depurar').
+        """
+        def busca(controles, nivel):
+            for c in controles:
+                try:
+                    if c.Id == ID_COMANDO_COMPILAR:
+                        return c
+                except Exception:
+                    continue
+                if nivel < 2:  # entra em submenus (popups), sem descer demais
+                    try:
+                        achado = busca(c.Controls, nivel + 1)
+                    except Exception:
+                        achado = None
+                    if achado is not None:
+                        return achado
+            return None
+
+        try:
+            barras = [vbe.CommandBars("Menu Bar")]  # nome interno, nao localizado
+        except Exception:
+            barras = list(vbe.CommandBars)
+        for barra in barras:
+            achado = busca(barra.Controls, 0)
+            if achado is not None:
+                return achado
+        return None
+
+    def verificar(self):
+        """Compila o projeto VBA (Depurar > Compilar) e informa se ha erro.
+
+        Retorna True se compilou sem erro. Em caso de erro de compilacao o
+        proprio VBE abre uma caixa de dialogo com a descricao; a janela do
+        VBE e exibida antes, para essa caixa poder ser lida e fechada (se o
+        Excel estivesse invisivel, a caixa bloquearia a automacao as cegas).
+        Nao altera nem salva o workbook.
+        """
+        vbe = self.excel.VBE
+        try:
+            vbe.ActiveVBProject = self.wb.VBProject
+        except Exception:
+            pass  # com um unico workbook aberto o projeto ativo ja e o dele
+        ctrl = self._controle_compilar(vbe)
+        if ctrl is None:
+            raise RuntimeError("Botao 'Compilar' nao encontrado nos menus do VBE.")
+        if not ctrl.Enabled:
+            # O VBE desabilita 'Compilar' quando o projeto ja esta compilado
+            print("OK: projeto ja estava compilado.")
+            return True
+        vbe.MainWindow.Visible = True
+        print("Compilando... (se o VBE abrir uma caixa de erro, leia e feche-a)")
+        ctrl.Execute()
+        for _ in range(20):  # o estado do botao pode demorar a atualizar
+            if not ctrl.Enabled:
+                break
+            time.sleep(0.25)
+        sucesso = not ctrl.Enabled
+        vbe.MainWindow.Visible = False
+        if sucesso:
+            print("OK: projeto compilado sem erros.")
+        else:
+            print("FALHOU: o projeto NAO compilou. Veja o erro exibido pelo VBE "
+                  "(ou abra o workbook e use Depurar > Compilar).")
+        return sucesso
+
     def editar(self, nome_modulo, texto_de, texto_para, todas=True):
         """Busca e substitui texto dentro do codigo de um modulo.
 
@@ -338,9 +476,35 @@ def main(argv=None):
     sp = sub.add_parser("remover", help="Remove um modulo.")
     sp.add_argument("--modulo", required=True)
 
+    sp = sub.add_parser("ler", help="Imprime o codigo de um modulo ou procedimento.")
+    sp.add_argument("--modulo", required=True)
+    sp.add_argument("--proc", help="Nome de um Sub/Function especifico.")
+    sp.add_argument("--numerar", action="store_true",
+                    help="Prefixa cada linha com o numero real dela no modulo.")
+
+    sp = sub.add_parser("procurar", help="Busca texto no codigo dos modulos.")
+    sp.add_argument("--texto", required=True, help="Texto a procurar.")
+    sp.add_argument("--modulo", help="Limita a busca a um unico modulo.")
+    sp.add_argument("--sensivel", action="store_true",
+                    help="Diferencia maiusculas de minusculas.")
+
+    sub.add_parser("verificar", help="Compila o projeto VBA e informa se ha erro.")
+
     args = p.parse_args(argv)
 
-    with VBAEditor(args.workbook, visivel=args.visivel) as ed:
+    # Acentos fora do charset do console nao devem derrubar o programa
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+
+    # Somente comandos que alteram o projeto salvam o workbook ao fechar.
+    # Salvar em comando de leitura reescreveria o arquivo inteiro a toa
+    # (mtime e bytes mudam, e o git acusaria alteracao sem haver edicao).
+    comandos_que_salvam = {"importar", "substituir", "editar", "adicionar", "remover"}
+
+    ed = VBAEditor(args.workbook, visivel=args.visivel)
+    ed.abrir()
+    verificacao_ok = True
+    try:
         if args.comando == "listar":
             ed.listar()
         elif args.comando == "backup":
@@ -358,6 +522,18 @@ def main(argv=None):
             ed.adicionar(args.modulo, args.tipo)
         elif args.comando == "remover":
             ed.remover(args.modulo)
+        elif args.comando == "ler":
+            ed.ler(args.modulo, proc=args.proc, numerar=args.numerar)
+        elif args.comando == "procurar":
+            ed.procurar(args.texto, modulo=args.modulo, sensivel=args.sensivel)
+        elif args.comando == "verificar":
+            verificacao_ok = ed.verificar()
+    except BaseException:
+        ed.fechar(salvar=False)  # erro: nunca salva
+        raise
+    ed.fechar(salvar=args.comando in comandos_que_salvam)
+    if not verificacao_ok:
+        sys.exit(1)  # permite usar 'verificar' em scripts: exit code 1 = nao compilou
 
 
 if __name__ == "__main__":
