@@ -49,6 +49,8 @@ import argparse
 from datetime import datetime
 
 import win32com.client
+import win32con
+import win32gui
 
 
 def _nome_seguro(nome):
@@ -379,13 +381,38 @@ class VBAEditor:
                 return achado
         return None
 
+    @staticmethod
+    def _dialogo_erro_compilacao():
+        """Procura a caixa de erro do VBE. Retorna (hwnd, mensagem) ou None."""
+        achados = []
+
+        def enum_cb(hwnd, acc):
+            if (win32gui.IsWindowVisible(hwnd)
+                    and win32gui.GetClassName(hwnd) == "#32770"
+                    and "Visual Basic" in win32gui.GetWindowText(hwnd)):
+                acc.append(hwnd)
+
+        win32gui.EnumWindows(enum_cb, achados)
+        if not achados:
+            return None
+        hwnd = achados[0]
+        textos = []
+        win32gui.EnumChildWindows(
+            hwnd,
+            lambda h, acc: acc.append(
+                (win32gui.GetClassName(h), win32gui.GetWindowText(h))),
+            textos)
+        mensagem = " ".join(t.replace("\r", " ").replace("\n", " ").strip()
+                            for cls, t in textos
+                            if cls == "Static" and t.strip())
+        return hwnd, mensagem
+
     def verificar(self):
         """Compila o projeto VBA (Depurar > Compilar) e informa se ha erro.
 
-        Retorna True se compilou sem erro. Em caso de erro de compilacao o
-        proprio VBE abre uma caixa de dialogo com a descricao; a janela do
-        VBE e exibida antes, para essa caixa poder ser lida e fechada (se o
-        Excel estivesse invisivel, a caixa bloquearia a automacao as cegas).
+        Em caso de erro de compilacao, captura a mensagem da caixa de
+        dialogo do VBE, fecha-a sozinho e informa modulo/linha do erro
+        (o VBE deixa o cursor exatamente nela). Retorna True se compilou.
         Nao altera nem salva o workbook.
         """
         vbe = self.excel.VBE
@@ -400,21 +427,41 @@ class VBAEditor:
             # O VBE desabilita 'Compilar' quando o projeto ja esta compilado
             print("OK: projeto ja estava compilado.")
             return True
-        vbe.MainWindow.Visible = True
-        print("Compilando... (se o VBE abrir uma caixa de erro, leia e feche-a)")
-        ctrl.Execute()
-        for _ in range(20):  # o estado do botao pode demorar a atualizar
-            if not ctrl.Enabled:
-                break
-            time.sleep(0.25)
-        sucesso = not ctrl.Enabled
-        vbe.MainWindow.Visible = False
-        if sucesso:
-            print("OK: projeto compilado sem erros.")
-        else:
-            print("FALHOU: o projeto NAO compilou. Veja o erro exibido pelo VBE "
-                  "(ou abra o workbook e use Depurar > Compilar).")
-        return sucesso
+
+        vbe.MainWindow.Visible = True  # a caixa de erro so aparece com o VBE visivel
+        try:
+            ctrl.Execute()
+            dialogo = None
+            for _ in range(40):  # ate 10 s
+                time.sleep(0.25)
+                dialogo = self._dialogo_erro_compilacao()
+                if dialogo is not None or not ctrl.Enabled:
+                    break
+
+            if dialogo is None and not ctrl.Enabled:
+                print("OK: projeto compilado sem erros.")
+                return True
+
+            mensagem = ""
+            if dialogo is not None:
+                hwnd, mensagem = dialogo
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                time.sleep(0.5)
+
+            print("FALHOU: o projeto NAO compilou.")
+            if mensagem:
+                print(f"  Mensagem do VBE: {mensagem}")
+            try:
+                painel = vbe.ActiveCodePane
+                cm = painel.CodeModule
+                linha = painel.GetSelection()[0]
+                print(f"  Local: {cm.Parent.Name}, linha {linha}:")
+                print(f"    {cm.Lines(linha, 1).strip()}")
+            except Exception:
+                pass  # sem localizacao, a mensagem ja ajuda
+            return False
+        finally:
+            vbe.MainWindow.Visible = False
 
     def editar(self, nome_modulo, texto_de, texto_para, todas=True):
         """Busca e substitui texto dentro do codigo de um modulo.
