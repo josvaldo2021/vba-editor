@@ -10,7 +10,8 @@ Usa pywin32 (win32com) para controlar o Excel e acessar o VBProject de um arquiv
   - importar  : inserir um modulo a partir de um arquivo
   - substituir: trocar todo o codigo de um modulo por um novo conteudo
   - editar    : buscar e substituir texto dentro do codigo de um modulo
-  - adicionar : criar um modulo novo (standard ou classe)
+  - adicionar : criar um modulo novo (standard, classe ou UserForm vazio)
+  - criar-form: criar um UserForm com controles a partir de um spec JSON
   - remover   : apagar um modulo
   - listar    : mostrar os modulos existentes
   - ler       : imprimir o codigo de um modulo (ou de um procedimento)
@@ -34,6 +35,8 @@ EXEMPLOS DE USO (linha de comando)
     python vba_editor.py arquivo.xlsm substituir --modulo Module1 --codigo novo.bas
     python vba_editor.py arquivo.xlsm editar --modulo Module1 --de "ValorAntigo" --para "ValorNovo"
     python vba_editor.py arquivo.xlsm adicionar --modulo MeuModulo --tipo std
+    python vba_editor.py arquivo.xlsm adicionar --modulo frmVazio --tipo form
+    python vba_editor.py arquivo.xlsm criar-form --spec form.json
     python vba_editor.py arquivo.xlsm remover --modulo MeuModulo
     python vba_editor.py arquivo.xlsm ler --modulo Module1 --proc MinhaSub
     python vba_editor.py arquivo.xlsm procurar --texto "tblProgramacao"
@@ -43,6 +46,7 @@ EXEMPLOS DE USO (linha de comando)
 import os
 import re
 import sys
+import json
 import time
 import shutil
 import argparse
@@ -68,6 +72,51 @@ TIPO_NOME = {
     VBEXT_CT_CLASS_MODULE: "Modulo de classe",
     VBEXT_CT_MSFORM: "UserForm",
     VBEXT_CT_DOCUMENT: "Documento (planilha/workbook)",
+}
+
+# ProgId dos controles de UserForm (biblioteca MSForms). Aceita nomes
+# amigaveis (pt/en) -> o identificador que o Designer.Controls.Add espera.
+PROGID_CONTROLE = {
+    "label": "Forms.Label.1",
+    "rotulo": "Forms.Label.1",
+    "textbox": "Forms.TextBox.1",
+    "texto": "Forms.TextBox.1",
+    "commandbutton": "Forms.CommandButton.1",
+    "botao": "Forms.CommandButton.1",
+    "combobox": "Forms.ComboBox.1",
+    "listbox": "Forms.ListBox.1",
+    "lista": "Forms.ListBox.1",
+    "checkbox": "Forms.CheckBox.1",
+    "caixaselecao": "Forms.CheckBox.1",
+    "optionbutton": "Forms.OptionButton.1",
+    "opcao": "Forms.OptionButton.1",
+    "togglebutton": "Forms.ToggleButton.1",
+    "frame": "Forms.Frame.1",
+    "quadro": "Forms.Frame.1",
+    "image": "Forms.Image.1",
+    "imagem": "Forms.Image.1",
+    "spinbutton": "Forms.SpinButton.1",
+    "scrollbar": "Forms.ScrollBar.1",
+    "multipage": "Forms.MultiPage.1",
+    "tabstrip": "Forms.TabStrip.1",
+}
+
+# Aliases pt -> nome real da propriedade do form/controle. Chaves nao
+# listadas aqui sao repassadas como estao (ex: "Font", "BackColor").
+ALIAS_PROP = {
+    "nome": "Name",
+    "caption": "Caption",
+    "titulo": "Caption",
+    "texto": "Text",
+    "valor": "Value",
+    "left": "Left",
+    "esquerda": "Left",
+    "top": "Top",
+    "topo": "Top",
+    "width": "Width",
+    "largura": "Width",
+    "height": "Height",
+    "altura": "Height",
 }
 
 # Id do botao 'Depurar > Compilar VBAProject' nos menus do VBE
@@ -250,14 +299,114 @@ class VBAEditor:
         return comp.Name
 
     def adicionar(self, nome_modulo, tipo="std"):
-        """Cria um modulo novo. tipo: 'std' (padrao) ou 'classe'."""
-        mapa = {"std": VBEXT_CT_STD_MODULE, "classe": VBEXT_CT_CLASS_MODULE}
+        """Cria um modulo novo. tipo: 'std', 'classe' ou 'form' (UserForm vazio).
+
+        Para criar um UserForm ja com controles, use criar_form().
+        """
+        mapa = {
+            "std": VBEXT_CT_STD_MODULE,
+            "classe": VBEXT_CT_CLASS_MODULE,
+            "form": VBEXT_CT_MSFORM,
+        }
         if tipo not in mapa:
-            raise ValueError("tipo deve ser 'std' ou 'classe'.")
+            raise ValueError("tipo deve ser 'std', 'classe' ou 'form'.")
         self._garantir_backup()
         comp = self._componentes.Add(mapa[tipo])
         comp.Name = nome_modulo
         print(f"Modulo '{nome_modulo}' ({tipo}) criado.")
+        return comp.Name
+
+    @staticmethod
+    def _aplicar_props(obj, props):
+        """Aplica um dict de propriedades a um controle do form.
+
+        Traduz aliases em portugues (ver ALIAS_PROP) e ignora, com aviso,
+        qualquer propriedade que o objeto nao aceite -- assim um nome de
+        propriedade errado no spec nao aborta a criacao do form inteiro.
+        """
+        for chave, valor in props.items():
+            nome = ALIAS_PROP.get(str(chave).lower(), chave)
+            try:
+                setattr(obj, nome, valor)
+            except Exception as e:
+                print(f"  [aviso] propriedade '{nome}'={valor!r} ignorada: {e}")
+
+    @staticmethod
+    def _aplicar_props_form(comp, designer, props):
+        """Aplica propriedades ao proprio UserForm.
+
+        As propriedades de projeto do form (Caption, Width, Height, ...) vivem
+        na colecao VBComponent.Properties -- setar via Designer nao persiste
+        depois de salvar. Tenta Properties primeiro e cai para o Designer no
+        que nao existir la.
+        """
+        for chave, valor in props.items():
+            nome = ALIAS_PROP.get(str(chave).lower(), chave)
+            try:
+                comp.Properties(nome).Value = valor
+                continue
+            except Exception:
+                pass
+            try:
+                setattr(designer, nome, valor)
+            except Exception as e:
+                print(f"  [aviso] propriedade '{nome}'={valor!r} ignorada: {e}")
+
+    def criar_form(self, spec):
+        """Cria um UserForm completo a partir de uma especificacao (dict).
+
+        Formato do spec:
+            {
+              "nome":     "frmExemplo",      # nome do UserForm (opcional)
+              "caption":  "Titulo",          # legenda da janela (opcional)
+              "largura":  300, "altura": 200,# tamanho do form (opcional)
+              "propriedades": { ... },       # props extras do form (opcional)
+              "controles": [                 # lista de controles (opcional)
+                 {"tipo": "label",  "nome": "lbl1", "caption": "Nome:",
+                  "left": 12, "top": 12, "width": 60, "height": 18},
+                 {"tipo": "textbox","nome": "txtNome",
+                  "left": 80, "top": 10, "width": 180, "height": 20},
+                 {"tipo": "botao",  "nome": "btnOK", "caption": "OK",
+                  "left": 80, "top": 50, "width": 80, "height": 24}
+              ],
+              "codigo": "Private Sub btnOK_Click()\\n...\\nEnd Sub"  # opcional
+            }
+
+        Retorna o nome final do UserForm criado.
+        """
+        self._garantir_backup()
+        comp = self._componentes.Add(VBEXT_CT_MSFORM)
+        if spec.get("nome"):
+            comp.Name = spec["nome"]
+        designer = comp.Designer
+
+        # Propriedades do proprio form (caption/tamanho + extras).
+        props_form = {}
+        for chave in ("caption", "titulo", "largura", "altura", "width", "height"):
+            if chave in spec:
+                props_form[chave] = spec[chave]
+        props_form.update(spec.get("propriedades", {}))
+        self._aplicar_props_form(comp, designer, props_form)
+
+        # Controles.
+        controles = spec.get("controles", [])
+        for c in controles:
+            tipo = str(c.get("tipo", "")).lower()
+            progid = PROGID_CONTROLE.get(tipo)
+            if progid is None:
+                raise ValueError(
+                    f"Tipo de controle desconhecido: '{c.get('tipo')}'. "
+                    f"Validos: {', '.join(sorted(set(PROGID_CONTROLE)))}."
+                )
+            ctrl = designer.Controls.Add(progid)
+            resto = {k: v for k, v in c.items() if k != "tipo"}
+            self._aplicar_props(ctrl, resto)
+
+        # Codigo VBA do modulo do form (ex: handlers _Click).
+        if spec.get("codigo"):
+            comp.CodeModule.AddFromString(spec["codigo"])
+
+        print(f"UserForm '{comp.Name}' criado com {len(controles)} controle(s).")
         return comp.Name
 
     def remover(self, nome_modulo):
@@ -538,9 +687,14 @@ def main(argv=None):
     sp.add_argument("--primeira", action="store_true",
                     help="Substitui apenas a primeira ocorrencia.")
 
-    sp = sub.add_parser("adicionar", help="Cria um modulo novo.")
+    sp = sub.add_parser("adicionar", help="Cria um modulo novo (std/classe/form vazio).")
     sp.add_argument("--modulo", required=True)
-    sp.add_argument("--tipo", choices=["std", "classe"], default="std")
+    sp.add_argument("--tipo", choices=["std", "classe", "form"], default="std")
+
+    sp = sub.add_parser("criar-form",
+                        help="Cria um UserForm com controles a partir de um spec JSON.")
+    sp.add_argument("--spec", required=True,
+                    help="Arquivo JSON com a especificacao do form e seus controles.")
 
     sp = sub.add_parser("remover", help="Remove um modulo.")
     sp.add_argument("--modulo", required=True)
@@ -568,7 +722,8 @@ def main(argv=None):
     # Somente comandos que alteram o projeto salvam o workbook ao fechar.
     # Salvar em comando de leitura reescreveria o arquivo inteiro a toa
     # (mtime e bytes mudam, e o git acusaria alteracao sem haver edicao).
-    comandos_que_salvam = {"importar", "substituir", "editar", "adicionar", "remover"}
+    comandos_que_salvam = {"importar", "substituir", "editar", "adicionar",
+                           "remover", "criar-form"}
 
     ed = VBAEditor(args.workbook, visivel=args.visivel)
     ed.abrir()
@@ -589,6 +744,9 @@ def main(argv=None):
             ed.editar(args.modulo, args.de, args.para, todas=not args.primeira)
         elif args.comando == "adicionar":
             ed.adicionar(args.modulo, args.tipo)
+        elif args.comando == "criar-form":
+            with open(args.spec, "r", encoding="utf-8") as f:
+                ed.criar_form(json.load(f))
         elif args.comando == "remover":
             ed.remover(args.modulo)
         elif args.comando == "ler":
