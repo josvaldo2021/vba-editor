@@ -263,6 +263,10 @@ class VBAEditor:
         Modulos que falharem (ex: nome com caractere problematico) sao pulados
         e reportados ao final, sem interromper o backup dos demais.
         """
+        # Caminho ABSOLUTO: o Export do COM resolve caminho relativo contra o
+        # diretorio de trabalho do Excel (ex: Documentos), nao o do Python --
+        # com caminho relativo todos os modulos falhariam.
+        pasta_destino = os.path.abspath(pasta_destino)
         os.makedirs(pasta_destino, exist_ok=True)
         exportados = []
         falhas = []
