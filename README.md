@@ -60,7 +60,58 @@ eventos) a partir de um arquivo JSON. Exemplo de `form.json`:
 > A ferramenta cria uma instância própria e isolada do Excel (`DispatchEx`) —
 > ela nunca toca numa sessão do Excel que você já tenha aberta. Se o **próprio
 > workbook alvo** estiver aberto, ela aborta com aviso (detecta o lock `~$`);
-> feche-o antes de rodar.
+> feche-o antes de rodar. Isso vale só para os comandos que gravam: os de
+> leitura abrem em somente-leitura e não se importam com o lock.
+
+## Abertura de workbooks problemáticos
+
+Alguns workbooks travavam a automação na abertura. O que a ferramenta faz hoje:
+
+- **Diálogo "Nomes em conflito"** (nomes definidos duplicados, típico
+  `_FilterDatabase`): uma thread vigia responde sozinha, digitando um nome
+  novo e confirmando. Detalhes que importam para quem for mexer nisso:
+  - o diálogo **não** é um `#32770`: ele vem na classe própria do Excel
+    `bosa_sdm_XL9`, e sua caixa de texto é `EDTBX`, não `Edit`;
+  - ele **não tem botões-janela** — a confirmação sai por `ENTER` na caixa;
+  - a digitação usa `WM_CHAR` via `PostMessage`. `SendInput`/`keybd_event` não
+    funcionam: exigem que a janela seja a foreground do desktop interativo, o
+    que nunca acontece com um Excel invisível rodando por automação;
+  - o nome digitado **não pode começar com `_`** — o Excel recusa como nome
+    interno e abre um segundo diálogo de erro (que o vigia também trata);
+  - **cancelar não resolve**: o Cancel aborta o `Workbooks.Open` inteiro, que
+    estoura `0x800A03EC` ("O método Open da classe Workbooks falhou").
+  - use `corrigir-nomes` para eliminar a causa e não depender mais do vigia.
+- **Qualquer outro diálogo** que trave a abertura é reportado com título,
+  texto e botões, em vez de deixar a automação esperando calada.
+- **Recálculo desligado antes do `Open`**: em modo automático, abrir um arquivo
+  grande recalcula a pasta inteira durante o próprio `Open`.
+- **Comandos de leitura** (`listar`, `ler`, `exportar`, `procurar`,
+  `verificar`, `backup`) abrem o arquivo em somente-leitura. Além de dispensar
+  fechar o workbook antes, isso contorna workbooks que recusam a abertura para
+  escrita via automação.
+
+## Cabeçalho de export é descartado automaticamente
+
+`substituir` aceita um arquivo `.bas`/`.cls`/`.frm` **exportado** direto, sem
+edição manual: o cabeçalho de export é removido antes de o código entrar no
+módulo.
+
+Isso importa porque esse cabeçalho é metadado do **arquivo**, não código — o
+painel do VBE nem o exibe. Reinseri-lo por `AddFromString` deixa uma linha
+inválida dentro do módulo e o projeto para de compilar:
+
+- `.bas` → `Attribute VB_Name = "..."`
+- `.cls` / `.frm` → bloco `VERSION 1.0 CLASS` / `BEGIN` … `END` mais os
+  vários `Attribute VB_*` (caso pior: `VERSION`, `BEGIN` e `END` viram
+  linhas de código sem sentido)
+
+Quando algo é descartado, a ferramenta informa:
+
+```
+  [cabecalho] 1 linha(s) de cabecalho de export descartada(s): Attribute VB_Name = "Inversao_lotes"
+```
+
+Código que já vem sem cabeçalho passa intacto.
 
 ## Uso como biblioteca
 
