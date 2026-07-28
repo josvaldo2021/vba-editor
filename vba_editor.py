@@ -12,6 +12,10 @@ Usa pywin32 (win32com) para controlar o Excel e acessar o VBProject de um arquiv
   - editar    : buscar e substituir texto dentro do codigo de um modulo
   - adicionar : criar um modulo novo (standard, classe ou UserForm vazio)
   - criar-form: criar um UserForm com controles a partir de um spec JSON
+  - adicionar-controle : acrescentar um controle a um UserForm que ja existe
+    (criar-form so monta form novo; recriar um form perderia layout e .frx)
+  - config-controle : alterar propriedades de um controle ja existente
+    (legenda, posicao, tamanho) sem remover e recriar
   - remover   : apagar um modulo
   - listar    : mostrar os modulos existentes
   - ler       : imprimir o codigo de um modulo (ou de um procedimento)
@@ -974,6 +978,80 @@ class VBAEditor:
         print(f"UserForm '{comp.Name}' criado com {len(controles)} controle(s).")
         return comp.Name
 
+    def adicionar_controle(self, nome_form, tipo, nome_controle, props=None):
+        """Acrescenta um controle a um UserForm que JA EXISTE.
+
+        criar_form() so monta form novo. Para mexer num form ja pronto ela
+        nao serve: recriar o form perderia o layout e o .frx atuais. Aqui o
+        alvo e localizado por _achar() e o controle entra no Designer dele,
+        preservando tudo o que ja estava la.
+
+        Retorna o nome do controle criado.
+        """
+        comp = self._achar(nome_form)
+        if comp.Type != VBEXT_CT_MSFORM:
+            raise ValueError(
+                f"'{nome_form}' nao e um UserForm (Type={comp.Type}). "
+                "So UserForms tem Designer para receber controles."
+            )
+
+        chave = str(tipo).lower()
+        progid = PROGID_CONTROLE.get(chave)
+        if progid is None:
+            raise ValueError(
+                f"Tipo de controle desconhecido: '{tipo}'. "
+                f"Validos: {', '.join(sorted(set(PROGID_CONTROLE)))}."
+            )
+
+        designer = comp.Designer
+        for existente in designer.Controls:
+            if existente.Name.lower() == str(nome_controle).lower():
+                raise ValueError(
+                    f"O form '{comp.Name}' ja tem um controle chamado "
+                    f"'{existente.Name}'. Escolha outro nome."
+                )
+
+        self._garantir_backup()
+        ctrl = designer.Controls.Add(progid)
+        ctrl.Name = nome_controle
+        self._aplicar_props(ctrl, props or {})
+        print(f"Controle '{ctrl.Name}' ({chave}) adicionado ao form "
+              f"'{comp.Name}'.")
+        return ctrl.Name
+
+    def configurar_controle(self, nome_form, nome_controle, props):
+        """Altera propriedades de um controle que JA EXISTE num UserForm.
+
+        Complementa adicionar_controle(): sem isto, corrigir uma legenda ou
+        reposicionar um controle exigiria remover e recriar, perdendo
+        qualquer outra propriedade ja ajustada a mao no Designer.
+        """
+        comp = self._achar(nome_form)
+        if comp.Type != VBEXT_CT_MSFORM:
+            raise ValueError(
+                f"'{nome_form}' nao e um UserForm (Type={comp.Type})."
+            )
+        designer = comp.Designer
+        alvo = None
+        for c in designer.Controls:
+            if c.Name.lower() == str(nome_controle).lower():
+                alvo = c
+                break
+        if alvo is None:
+            existentes = ", ".join(c.Name for c in designer.Controls)
+            raise KeyError(
+                f"O form '{comp.Name}' nao tem controle '{nome_controle}'. "
+                f"Tem: {existentes}."
+            )
+        if not props:
+            raise ValueError("Nada a alterar: --propriedades veio vazio.")
+
+        self._garantir_backup()
+        self._aplicar_props(alvo, props)
+        print(f"Controle '{alvo.Name}' do form '{comp.Name}' atualizado "
+              f"({len(props)} propriedade(s)).")
+        return alvo.Name
+
     def remover(self, nome_modulo):
         """Remove um modulo. Documentos (planilhas/ThisWorkbook) nao podem ser removidos."""
         comp = self._achar(nome_modulo)
@@ -1341,6 +1419,23 @@ def main(argv=None):
     sp.add_argument("--spec", required=True,
                     help="Arquivo JSON com a especificacao do form e seus controles.")
 
+    sp = sub.add_parser("adicionar-controle",
+                        help="Acrescenta um controle a um UserForm existente.")
+    sp.add_argument("--modulo", required=True, help="UserForm que recebe o controle.")
+    sp.add_argument("--tipo", required=True,
+                    help="Tipo do controle (ex: checkbox, textbox, botao).")
+    sp.add_argument("--nome", required=True, help="Nome do controle criado.")
+    sp.add_argument("--propriedades",
+                    help="JSON com propriedades (caption, left, top, width, "
+                         "height, value...).")
+
+    sp = sub.add_parser("config-controle",
+                        help="Altera propriedades de um controle existente.")
+    sp.add_argument("--modulo", required=True, help="UserForm que contem o controle.")
+    sp.add_argument("--nome", required=True, help="Nome do controle a alterar.")
+    sp.add_argument("--propriedades", required=True,
+                    help="JSON com as propriedades a alterar.")
+
     sp = sub.add_parser("remover", help="Remove um modulo.")
     sp.add_argument("--modulo", required=True)
 
@@ -1375,7 +1470,8 @@ def main(argv=None):
     # Salvar em comando de leitura reescreveria o arquivo inteiro a toa
     # (mtime e bytes mudam, e o git acusaria alteracao sem haver edicao).
     comandos_que_salvam = {"importar", "substituir", "editar", "adicionar",
-                           "remover", "criar-form", "corrigir-nomes"}
+                           "remover", "criar-form", "adicionar-controle",
+                           "config-controle", "corrigir-nomes"}
 
     # Comandos que nao salvam abrem o arquivo em somente-leitura: dispensa
     # fechar o workbook antes de rodar e contorna workbooks que recusam a
@@ -1407,6 +1503,12 @@ def main(argv=None):
         elif args.comando == "criar-form":
             with open(args.spec, "r", encoding="utf-8") as f:
                 ed.criar_form(json.load(f))
+        elif args.comando == "adicionar-controle":
+            props = json.loads(args.propriedades) if args.propriedades else {}
+            ed.adicionar_controle(args.modulo, args.tipo, args.nome, props)
+        elif args.comando == "config-controle":
+            ed.configurar_controle(args.modulo, args.nome,
+                                   json.loads(args.propriedades))
         elif args.comando == "remover":
             ed.remover(args.modulo)
         elif args.comando == "ler":
