@@ -27,7 +27,28 @@ python vba_editor.py "workbook.xlsm" adicionar --modulo MeuModulo --tipo std
 python vba_editor.py "workbook.xlsm" adicionar --modulo frmVazio  --tipo form
 python vba_editor.py "workbook.xlsm" criar-form --spec form.json
 python vba_editor.py "workbook.xlsm" remover --modulo MeuModulo
+python vba_editor.py "workbook.xlsm" trocar-linha --modulo Mod1 --de "x = 1" --para "x = 2" --proc Calcular
+python vba_editor.py "workbook.xlsm" substituir-proc --modulo Mod1 --proc Calcular --codigo proc.txt --manter-cabecalho
 ```
+
+## Acrescentar controle a um UserForm existente
+
+```bash
+python vba_editor.py "workbook.xlsm" adicionar-controle --modulo frmCadastro --tipo combobox \
+    --nome cbFabricante --dentro-de Frame1 --modelo cbLocal \
+    --propriedades "{\"left\": 18, \"top\": 216, \"width\": 144, \"height\": 25, \"Style\": 2}"
+```
+
+- **`--dentro-de`**: o controle entra no Frame (ou outro container) indicado, e `left`/`top`
+  passam a ser relativos a ele. Sem isso, numa tela montada dentro de um Frame o controle
+  novo cai no form, **por baixo** do Frame, e fica invisível.
+- **`--modelo`**: copia a **aparência** de um controle existente (fonte, cores, borda, efeito)
+  antes de aplicar `--propriedades`, para o campo novo nascer igual aos vizinhos. Tamanho e
+  posição não são copiados.
+- **`config-form`** muda o **próprio** UserForm (`{"Height": 450}`), para a janela crescer junto
+  com o campo novo — `config-controle` só alcança controles.
+- Propriedades de sub-objeto usam ponto: `"Font.Size": 10`, `"Font.Bold": true` (vale também
+  para `config-controle`).
 
 ## Criar um UserForm com controles
 
@@ -127,4 +148,17 @@ with VBAEditor("workbook.xlsm") as ed:          # salva ao sair, só se não hou
 
 - `*.xlsm` e `backups/` estão no `.gitignore` — este repositório versiona **apenas a ferramenta**.
 - `substituir_procedimento` usa `ProcStartLine`/`ProcCountLines` do VBE, evitando casar
-  texto (robusto a acentos/comentários).
+  texto (robusto a acentos/comentários). **Atenção**: o VBE conta como parte do procedimento
+  os comentários e linhas vazias **acima** dele, e o modo padrão os apaga. Para preservar um
+  bloco de comentário de cabeçalho, use `manter_cabecalho=True` (CLI `--manter-cabecalho`):
+  a troca vai da declaração ao `End`, e o código novo deve começar na declaração.
+- **Palavras reservadas como nome são recusadas antes de gravar.** `substituir`, `adicionar_codigo`,
+  `substituir_procedimento` e `trocar_linha` conferem as declarações (`Dim`/`Private`/`Public`/
+  `Static`/`Const`) e os parâmetros de `Sub`/`Function`/`Property`: um nome como `imp` (o operador
+  `Imp`), `eqv` ou `step` só estouraria como *"Erro de sintaxe"* quando o VBA compilasse o
+  procedimento — e o `verificar` não compila em toda máquina. Strings e comentários são ignorados.
+  Para forçar, `ed.checar_reservadas = False`. A função `nomes_reservados_usados(codigo)` também
+  pode ser chamada sozinha.
+- `trocar_linha` casa a linha **inteira**, sem olhar caixa nem espaços de borda (o VBE
+  re-capitaliza identificadores no projeto todo), mantém o recuo e **exige exatamente uma**
+  ocorrência — no módulo ou só dentro de `proc`. Âncora ambígua é erro, não palpite.

@@ -192,6 +192,97 @@ ALIAS_PROP = {
     "altura": "Height",
 }
 
+# Palavras reservadas do VBA que NAO podem ser nome de variavel, constante ou
+# parametro. Usar uma delas so estoura como "Erro de sintaxe" quando o VBA
+# compila o procedimento -- e o 'verificar' nao compila em toda maquina. Caso
+# real que motivou a checagem: "Dim imp As ..." ('Imp' e o operador de
+# implicacao logica, como 'Eqv').
+PALAVRAS_RESERVADAS_VBA = {
+    "and", "as", "boolean", "byref", "byte", "byval", "call", "case", "const",
+    "currency", "date", "declare", "dim", "do", "double", "each", "else",
+    "elseif", "end", "enum", "eqv", "erase", "event", "exit", "false", "for",
+    "friend", "function", "get", "global", "gosub", "goto", "if", "imp",
+    "implements", "in", "integer", "is", "let", "lib", "like", "long", "loop",
+    "lset", "me", "mod", "new", "next", "not", "nothing", "null", "on",
+    "option", "optional", "or", "paramarray", "preserve", "private",
+    "property", "public", "raiseevent", "redim", "rem", "resume", "return",
+    "rset", "select", "set", "single", "static", "step", "stop", "string",
+    "sub", "then", "to", "true", "type", "typeof", "until", "variant", "wend",
+    "while", "with", "withevents", "xor",
+}
+
+_RE_DECL_VAR = re.compile(
+    r"^\s*(?:Dim|Static|Private|Public|Global)\s+"
+    r"(?!(?:Sub|Function|Property|Declare|Type|Enum|Const|Event)\b)"
+    r"(?:WithEvents\s+)?(.+)$", re.IGNORECASE)
+_RE_DECL_CONST = re.compile(r"^\s*(?:(?:Private|Public|Global)\s+)?Const\s+(\w+)", re.IGNORECASE)
+_RE_DECL_PROC = re.compile(
+    r"^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?"
+    r"(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+\w+\s*\((.*)\)", re.IGNORECASE)
+
+
+def _separar_virgulas(texto):
+    """Divide por virgula FORA de parenteses (Dim a(1, 2), b)."""
+    partes, nivel, atual = [], 0, ""
+    for ch in texto:
+        if ch == "(":
+            nivel += 1
+        elif ch == ")":
+            nivel -= 1
+        if ch == "," and nivel == 0:
+            partes.append(atual)
+            atual = ""
+        else:
+            atual += ch
+    partes.append(atual)
+    return partes
+
+
+def nomes_reservados_usados(codigo):
+    """[(numero da linha, nome)] de palavras reservadas usadas como identificador.
+
+    Olha declaracoes (Dim/Static/Private/Public/Global/Const) e parametros de
+    Sub/Function/Property. Junta as linhas continuadas com ' _' antes, e ignora
+    comentarios e strings.
+    """
+    achados = []
+    linhas = codigo.replace("\r\n", "\n").split("\n")
+    i = 0
+    while i < len(linhas):
+        inicio = i
+        linha = linhas[i]
+        while linha.rstrip().endswith(" _") and i + 1 < len(linhas):
+            i += 1
+            linha = linha.rstrip()[:-2] + " " + linhas[i].strip()
+        i += 1
+        linha = re.sub(r'"[^"]*"', '""', linha)          # strings fora
+        linha = re.split(r"(?:^|\s)'|\bRem\b", linha)[0]  # comentario fora
+        nomes = []
+        m = _RE_DECL_PROC.match(linha)
+        if m:
+            for p in _separar_virgulas(m.group(1)):
+                p = re.sub(r"^\s*(?:Optional\s+)?(?:ByVal\s+|ByRef\s+)?(?:ParamArray\s+)?", "",
+                           p, flags=re.IGNORECASE)
+                mm = re.match(r"(\w+)", p)
+                if mm:
+                    nomes.append(mm.group(1))
+        else:
+            m = _RE_DECL_CONST.match(linha)
+            if m:
+                nomes.append(m.group(1))
+            else:
+                m = _RE_DECL_VAR.match(linha)
+                if m:
+                    for p in _separar_virgulas(m.group(1)):
+                        mm = re.match(r"\s*(\w+)", p)
+                        if mm:
+                            nomes.append(mm.group(1))
+        for n in nomes:
+            if n.lower() in PALAVRAS_RESERVADAS_VBA:
+                achados.append((inicio + 1, n))
+    return achados
+
+
 # Id do botao 'Depurar > Compilar VBAProject' nos menus do VBE
 # (independe do idioma do Office).
 ID_COMANDO_COMPILAR = 578
@@ -896,9 +987,38 @@ class VBAEditor:
         for chave, valor in props.items():
             nome = ALIAS_PROP.get(str(chave).lower(), chave)
             try:
-                setattr(obj, nome, valor)
+                # "Font.Size": propriedade de um sub-objeto. Sem isto, mexer na
+                # fonte de um controle exigia um driver COM a parte.
+                alvo = obj
+                partes = str(nome).split(".")
+                for p in partes[:-1]:
+                    alvo = getattr(alvo, p)
+                setattr(alvo, partes[-1], valor)
             except Exception as e:
                 print(f"  [aviso] propriedade '{nome}'={valor!r} ignorada: {e}")
+
+    # Aparencia que adicionar_controle(modelo=...) copia de um controle
+    # existente. Tamanho e posicao NAO entram: quem posiciona e o chamador.
+    PROPS_APARENCIA = ("ForeColor", "BackColor", "BackStyle", "BorderStyle",
+                       "BorderColor", "SpecialEffect", "TextAlign", "WordWrap")
+    PROPS_FONTE = ("Name", "Size", "Bold", "Italic", "Underline")
+
+    @classmethod
+    def _copiar_aparencia(cls, modelo, ctrl):
+        copiadas = []
+        for p in cls.PROPS_APARENCIA:
+            try:
+                setattr(ctrl, p, getattr(modelo, p))
+                copiadas.append(p)
+            except Exception:
+                pass  # nem todo tipo de controle tem toda propriedade
+        for p in cls.PROPS_FONTE:
+            try:
+                setattr(ctrl.Font, p, getattr(modelo.Font, p))
+                copiadas.append("Font." + p)
+            except Exception:
+                pass
+        return copiadas
 
     @staticmethod
     def _aplicar_props_form(comp, designer, props):
@@ -978,13 +1098,29 @@ class VBAEditor:
         print(f"UserForm '{comp.Name}' criado com {len(controles)} controle(s).")
         return comp.Name
 
-    def adicionar_controle(self, nome_form, tipo, nome_controle, props=None):
+    def _controle_do_form(self, designer, nome, nome_form):
+        for c in designer.Controls:
+            if c.Name.lower() == str(nome).lower():
+                return c
+        existentes = ", ".join(c.Name for c in designer.Controls)
+        raise KeyError(f"O form '{nome_form}' nao tem controle '{nome}'. Tem: {existentes}.")
+
+    def adicionar_controle(self, nome_form, tipo, nome_controle, props=None,
+                           dentro_de=None, modelo=None):
         """Acrescenta um controle a um UserForm que JA EXISTE.
 
         criar_form() so monta form novo. Para mexer num form ja pronto ela
         nao serve: recriar o form perderia o layout e o .frx atuais. Aqui o
         alvo e localizado por _achar() e o controle entra no Designer dele,
         preservando tudo o que ja estava la.
+
+        dentro_de: nome de um Frame (ou outro container) do form. O controle
+            entra NELE, e Left/Top passam a ser relativos a ele -- sem isto, um
+            campo novo numa tela montada dentro de um Frame caia no form, por
+            baixo do Frame, invisivel.
+        modelo: nome de um controle existente cuja APARENCIA (fonte, cores,
+            borda, efeito) e copiada antes das props -- para o campo novo
+            nascer igual aos vizinhos. Tamanho e posicao nao sao copiados.
 
         Retorna o nome do controle criado.
         """
@@ -1011,12 +1147,20 @@ class VBAEditor:
                     f"'{existente.Name}'. Escolha outro nome."
                 )
 
+        container = designer
+        if dentro_de:
+            container = self._controle_do_form(designer, dentro_de, comp.Name)
+        ref_modelo = self._controle_do_form(designer, modelo, comp.Name) if modelo else None
+
         self._garantir_backup()
-        ctrl = designer.Controls.Add(progid)
+        ctrl = container.Controls.Add(progid)
         ctrl.Name = nome_controle
+        if ref_modelo is not None:
+            copiadas = self._copiar_aparencia(ref_modelo, ctrl)
+            print(f"  aparencia copiada de '{ref_modelo.Name}': {len(copiadas)} propriedade(s)")
         self._aplicar_props(ctrl, props or {})
-        print(f"Controle '{ctrl.Name}' ({chave}) adicionado ao form "
-              f"'{comp.Name}'.")
+        onde = f"'{comp.Name}.{container.Name}'" if dentro_de else f"'{comp.Name}'"
+        print(f"Controle '{ctrl.Name}' ({chave}) adicionado a {onde}.")
         return ctrl.Name
 
     def configurar_controle(self, nome_form, nome_controle, props):
@@ -1052,6 +1196,24 @@ class VBAEditor:
               f"({len(props)} propriedade(s)).")
         return alvo.Name
 
+    def configurar_form(self, nome_form, props):
+        """Altera propriedades do PROPRIO UserForm (Height, Width, Caption...).
+
+        configurar_controle() so alcanca controles; crescer a janela para caber
+        um campo novo exigia um driver COM a parte. Usa o mesmo caminho de
+        criar_form: VBComponent.Properties primeiro (o que persiste ao salvar),
+        o Designer no que nao existir la.
+        """
+        comp = self._achar(nome_form)
+        if comp.Type != VBEXT_CT_MSFORM:
+            raise ValueError(f"'{nome_form}' nao e um UserForm (Type={comp.Type}).")
+        if not props:
+            raise ValueError("Nada a alterar: props veio vazio.")
+        self._garantir_backup()
+        self._aplicar_props_form(comp, comp.Designer, props)
+        print(f"UserForm '{comp.Name}' atualizado ({len(props)} propriedade(s)).")
+        return comp.Name
+
     def remover(self, nome_modulo):
         """Remove um modulo. Documentos (planilhas/ThisWorkbook) nao podem ser removidos."""
         comp = self._achar(nome_modulo)
@@ -1078,8 +1240,9 @@ class VBAEditor:
         o cabecalho de export e removido antes de inserir (ver
         _tirar_cabecalho_export).
         """
-        self._garantir_backup()
         novo_codigo, removidas = _tirar_cabecalho_export(novo_codigo)
+        self._recusar_reservadas(novo_codigo, nome_modulo)
+        self._garantir_backup()
         cm = self._achar(nome_modulo).CodeModule
         if cm.CountOfLines > 0:
             cm.DeleteLines(1, cm.CountOfLines)
@@ -1094,26 +1257,99 @@ class VBAEditor:
 
     def adicionar_codigo(self, nome_modulo, codigo):
         """Anexa codigo (string) ao final de um modulo existente."""
+        self._recusar_reservadas(codigo, nome_modulo)
         self._garantir_backup()
         cm = self._achar(nome_modulo).CodeModule
         cm.InsertLines(cm.CountOfLines + 1, codigo)
         print(f"Codigo anexado ao modulo '{nome_modulo}'.")
 
-    def substituir_procedimento(self, nome_modulo, nome_proc, novo_codigo, kind=0):
+    _FIM_PROC = re.compile(r"^\s*End\s+(Sub|Function|Property)\b", re.IGNORECASE)
+
+    def _faixa_da_declaracao(self, cm, nome_proc, kind):
+        """(declaracao, End) 1-based. ProcBodyLine e a linha do Sub/Function."""
+        decl = cm.ProcBodyLine(nome_proc, kind)
+        for i in range(decl, cm.CountOfLines + 1):
+            if self._FIM_PROC.match(cm.Lines(i, 1)):
+                return decl, i
+        raise RuntimeError(f"End de '{nome_proc}' nao encontrado.")
+
+    @staticmethod
+    def _crlf(texto):
+        return texto.replace("\r\n", "\n").replace("\n", "\r\n")
+
+    # Liga/desliga a recusa de codigo com palavra reservada usada como nome.
+    checar_reservadas = True
+
+    def _recusar_reservadas(self, codigo, onde):
+        """Recusa ANTES de gravar: o erro so apareceria ao compilar o procedimento."""
+        if not self.checar_reservadas:
+            return
+        achados = nomes_reservados_usados(codigo)
+        if achados:
+            lista = ", ".join(f"linha {n}: '{nome}'" for n, nome in achados)
+            raise ValueError(
+                f"Codigo para '{onde}' usa palavra reservada do VBA como nome ({lista}). "
+                "Isso da 'Erro de sintaxe' so na compilacao do procedimento. Renomeie. "
+                "(Para forcar, ed.checar_reservadas = False.)")
+
+    def substituir_procedimento(self, nome_modulo, nome_proc, novo_codigo, kind=0,
+                                manter_cabecalho=False):
         """Substitui um procedimento inteiro (Sub/Function/Property) pelo nome.
 
         Usa ProcStartLine/ProcCountLines do VBE -> robusto, nao depende de casar
         texto (evita problemas com acentos/comentarios). kind: 0=Proc/Sub/Function,
-        1=Set, 2=Get, 3=Let.
+        1=Let, 2=Set, 3=Get (vbext_ProcKind).
+
+        manter_cabecalho=True: troca so da DECLARACAO ao End. O VBE conta como
+        parte do procedimento os comentarios e linhas vazias ACIMA dele
+        (ProcStartLine), e o modo padrao os apaga -- o que destruia os blocos
+        de comentario de especificacao que os projetos poem acima de cada
+        procedimento. Nesse modo, novo_codigo deve comecar na declaracao.
         """
+        self._recusar_reservadas(novo_codigo, f"{nome_modulo}.{nome_proc}")
         self._garantir_backup()
         cm = self._achar(nome_modulo).CodeModule
-        inicio = cm.ProcStartLine(nome_proc, kind)
-        qtd = cm.ProcCountLines(nome_proc, kind)
+        if manter_cabecalho:
+            inicio, fim = self._faixa_da_declaracao(cm, nome_proc, kind)
+            qtd = fim - inicio + 1
+        else:
+            inicio = cm.ProcStartLine(nome_proc, kind)
+            qtd = cm.ProcCountLines(nome_proc, kind)
         cm.DeleteLines(inicio, qtd)
-        cm.InsertLines(inicio, novo_codigo)
+        cm.InsertLines(inicio, self._crlf(novo_codigo.rstrip("\r\n")))
         print(f"Procedimento '{nome_proc}' de '{nome_modulo}' substituido "
-              f"(linhas {inicio}..{inicio + qtd - 1}).")
+              f"(linhas {inicio}..{inicio + qtd - 1}"
+              f"{', cabecalho preservado' if manter_cabecalho else ''}).")
+
+    def trocar_linha(self, nome_modulo, antiga, nova, proc=None, kind=0):
+        """Troca UMA linha de codigo, casada inteira, sem olhar caixa nem espacos de borda.
+
+        Feita para ancoras: o VBE re-capitaliza identificadores no projeto
+        todo, entao casar com caixa falha a toa. Exige exatamente UMA
+        ocorrencia (no modulo, ou so dentro de `proc`) -- ancora ambigua ja
+        trocou a linha errada. O recuo da linha original e aplicado a cada
+        linha de `nova` (que pode ter varias linhas).
+        """
+        self._recusar_reservadas(nova, nome_modulo)
+        self._garantir_backup()
+        cm = self._achar(nome_modulo).CodeModule
+        if proc:
+            a, b = self._faixa_da_declaracao(cm, proc, kind)
+        else:
+            a, b = 1, cm.CountOfLines
+        alvo = antiga.strip().lower()
+        achadas = [i for i in range(a, b + 1) if cm.Lines(i, 1).strip().lower() == alvo]
+        if len(achadas) != 1:
+            onde = f"'{proc}'" if proc else f"'{nome_modulo}'"
+            raise ValueError(f"Linha {antiga!r} achada {len(achadas)} vez(es) em {onde}; "
+                             "esperado exatamente 1.")
+        i = achadas[0]
+        recuo = re.match(r"^\s*", cm.Lines(i, 1)).group(0)
+        linhas = [(recuo + l) if l.strip() else l for l in nova.replace("\r\n", "\n").split("\n")]
+        cm.DeleteLines(i, 1)
+        cm.InsertLines(i, "\r\n".join(linhas))
+        print(f"Linha {i} de '{nome_modulo}' trocada.")
+        return i
 
     def ler(self, nome_modulo, proc=None, numerar=False):
         """Imprime (e retorna) o codigo de um modulo ou de um procedimento.
@@ -1427,7 +1663,34 @@ def main(argv=None):
     sp.add_argument("--nome", required=True, help="Nome do controle criado.")
     sp.add_argument("--propriedades",
                     help="JSON com propriedades (caption, left, top, width, "
-                         "height, value...).")
+                         "height, value, \"Font.Size\"...).")
+    sp.add_argument("--dentro-de",
+                    help="Frame (ou outro container) que recebe o controle; "
+                         "left/top ficam relativos a ele.")
+    sp.add_argument("--modelo",
+                    help="Controle existente cuja aparencia (fonte, cores, "
+                         "borda) o novo copia.")
+
+    sp = sub.add_parser("trocar-linha",
+                        help="Troca UMA linha casada inteira, sem olhar caixa.")
+    sp.add_argument("--modulo", required=True)
+    sp.add_argument("--de", required=True, help="Linha atual (sem o recuo).")
+    sp.add_argument("--para", required=True, help="Linha(s) nova(s); o recuo e mantido.")
+    sp.add_argument("--proc", help="Procura so dentro deste procedimento.")
+
+    sp = sub.add_parser("substituir-proc",
+                        help="Substitui um procedimento inteiro pelo nome.")
+    sp.add_argument("--modulo", required=True)
+    sp.add_argument("--proc", required=True)
+    sp.add_argument("--codigo", required=True,
+                    help="Arquivo de texto com o procedimento novo.")
+    sp.add_argument("--manter-cabecalho", action="store_true",
+                    help="Preserva os comentarios acima da declaracao.")
+
+    sp = sub.add_parser("config-form",
+                        help="Altera propriedades do proprio UserForm (Height, Width, Caption).")
+    sp.add_argument("--modulo", required=True, help="UserForm a alterar.")
+    sp.add_argument("--propriedades", required=True, help="JSON com as propriedades.")
 
     sp = sub.add_parser("config-controle",
                         help="Altera propriedades de um controle existente.")
@@ -1471,7 +1734,8 @@ def main(argv=None):
     # (mtime e bytes mudam, e o git acusaria alteracao sem haver edicao).
     comandos_que_salvam = {"importar", "substituir", "editar", "adicionar",
                            "remover", "criar-form", "adicionar-controle",
-                           "config-controle", "corrigir-nomes"}
+                           "config-controle", "config-form", "corrigir-nomes", "trocar-linha",
+                           "substituir-proc"}
 
     # Comandos que nao salvam abrem o arquivo em somente-leitura: dispensa
     # fechar o workbook antes de rodar e contorna workbooks que recusam a
@@ -1505,7 +1769,16 @@ def main(argv=None):
                 ed.criar_form(json.load(f))
         elif args.comando == "adicionar-controle":
             props = json.loads(args.propriedades) if args.propriedades else {}
-            ed.adicionar_controle(args.modulo, args.tipo, args.nome, props)
+            ed.adicionar_controle(args.modulo, args.tipo, args.nome, props,
+                                  dentro_de=args.dentro_de, modelo=args.modelo)
+        elif args.comando == "trocar-linha":
+            ed.trocar_linha(args.modulo, args.de, args.para, proc=args.proc)
+        elif args.comando == "substituir-proc":
+            with open(args.codigo, "r", encoding="utf-8") as f:
+                ed.substituir_procedimento(args.modulo, args.proc, f.read(),
+                                           manter_cabecalho=args.manter_cabecalho)
+        elif args.comando == "config-form":
+            ed.configurar_form(args.modulo, json.loads(args.propriedades))
         elif args.comando == "config-controle":
             ed.configurar_controle(args.modulo, args.nome,
                                    json.loads(args.propriedades))
