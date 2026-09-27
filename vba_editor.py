@@ -1214,6 +1214,47 @@ class VBAEditor:
         print(f"UserForm '{comp.Name}' atualizado ({len(props)} propriedade(s)).")
         return comp.Name
 
+    def _planilha(self, aba):
+        """Acha uma planilha pelo nome da ABA ou pelo CodeName (Plan14)."""
+        alvo = str(aba).lower()
+        for ws in self.wb.Worksheets:
+            if ws.Name.lower() == alvo or ws.CodeName.lower() == alvo:
+                return ws
+        existentes = ", ".join(f"{ws.Name} ({ws.CodeName})" for ws in self.wb.Worksheets)
+        raise KeyError(f"Nao ha planilha '{aba}'. Tem: {existentes}.")
+
+    def adicionar_botao_planilha(self, aba, nome, texto, on_action,
+                                 left, top, width, height):
+        """Cria (ou atualiza) um BOTAO DE FORMULARIO numa planilha.
+
+        Botao de formulario, e nao ActiveX, de proposito: o OnAction aponta
+        para um Public Sub de .bas, que o gate exercita por Application.Run.
+        Um _Click Private de controle ActiveX nao tem probe possivel (licao
+        da fatia 062 do pcp_brglass).
+
+        Idempotente por `nome`: se o botao ja existe, so atualiza posicao,
+        texto e OnAction -- rodar o driver duas vezes deixa UM botao.
+        """
+        ws = self._planilha(aba)
+        self._garantir_backup()
+        botao = None
+        for b in ws.Buttons():
+            if b.Name.lower() == str(nome).lower():
+                botao = b
+                break
+        criado = botao is None
+        if criado:
+            botao = ws.Buttons().Add(float(left), float(top), float(width), float(height))
+            botao.Name = nome
+        else:
+            botao.Left, botao.Top = float(left), float(top)
+            botao.Width, botao.Height = float(width), float(height)
+        botao.Caption = texto
+        botao.OnAction = on_action
+        print(f"Botao '{botao.Name}' {'criado' if criado else 'atualizado'} na "
+              f"planilha '{ws.Name}' (OnAction={botao.OnAction}).")
+        return botao.Name
+
     def remover(self, nome_modulo):
         """Remove um modulo. Documentos (planilhas/ThisWorkbook) nao podem ser removidos."""
         comp = self._achar(nome_modulo)
@@ -1699,6 +1740,18 @@ def main(argv=None):
     sp.add_argument("--propriedades", required=True,
                     help="JSON com as propriedades a alterar.")
 
+    sp = sub.add_parser("adicionar-botao-planilha",
+                        help="Cria/atualiza um botao de formulario numa planilha, "
+                             "com OnAction para uma macro.")
+    sp.add_argument("--aba", required=True, help="Nome da aba ou CodeName (ex.: Plan14).")
+    sp.add_argument("--nome", required=True, help="Nome do botao (chave da idempotencia).")
+    sp.add_argument("--texto", required=True, help="Texto exibido no botao.")
+    sp.add_argument("--on-action", required=True, help="Macro chamada no clique.")
+    sp.add_argument("--left", type=float, required=True)
+    sp.add_argument("--top", type=float, required=True)
+    sp.add_argument("--width", type=float, required=True)
+    sp.add_argument("--height", type=float, required=True)
+
     sp = sub.add_parser("remover", help="Remove um modulo.")
     sp.add_argument("--modulo", required=True)
 
@@ -1735,7 +1788,7 @@ def main(argv=None):
     comandos_que_salvam = {"importar", "substituir", "editar", "adicionar",
                            "remover", "criar-form", "adicionar-controle",
                            "config-controle", "config-form", "corrigir-nomes", "trocar-linha",
-                           "substituir-proc"}
+                           "substituir-proc", "adicionar-botao-planilha"}
 
     # Comandos que nao salvam abrem o arquivo em somente-leitura: dispensa
     # fechar o workbook antes de rodar e contorna workbooks que recusam a
@@ -1782,6 +1835,9 @@ def main(argv=None):
         elif args.comando == "config-controle":
             ed.configurar_controle(args.modulo, args.nome,
                                    json.loads(args.propriedades))
+        elif args.comando == "adicionar-botao-planilha":
+            ed.adicionar_botao_planilha(args.aba, args.nome, args.texto, args.on_action,
+                                        args.left, args.top, args.width, args.height)
         elif args.comando == "remover":
             ed.remover(args.modulo)
         elif args.comando == "ler":
