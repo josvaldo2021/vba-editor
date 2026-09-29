@@ -1392,6 +1392,48 @@ class VBAEditor:
         print(f"Linha {i} de '{nome_modulo}' trocada.")
         return i
 
+    def remover_bloco(self, nome_modulo, linhas, proc=None, kind=0):
+        """Remove um BLOCO de linhas consecutivas, casadas uma a uma inteiras, sem
+        olhar caixa nem espacos de borda (como trocar_linha).
+
+        Feito para desfazer um trecho que outra fatia inseriu: o VBE re-capitaliza
+        identificadores no projeto todo, e restaurar o procedimento inteiro de um
+        commit antigo desfaria tambem as correcoes feitas depois nele. Exige que o
+        bloco apareca exatamente UMA vez (no modulo, ou so dentro de `proc`).
+        Devolve a linha (1-based) onde o bloco comecava.
+        """
+        alvo = [l.strip().lower() for l in linhas]
+        if not alvo:
+            raise ValueError("remover_bloco: bloco vazio.")
+        self._garantir_backup()
+        cm = self._achar(nome_modulo).CodeModule
+        if proc:
+            a, b = self._faixa_da_declaracao(cm, proc, kind)
+        else:
+            a, b = 1, cm.CountOfLines
+        n = len(alvo)
+        achadas = [i for i in range(a, b - n + 2)
+                   if all(cm.Lines(i + k, 1).strip().lower() == alvo[k] for k in range(n))]
+        if len(achadas) != 1:
+            onde = f"'{proc}'" if proc else f"'{nome_modulo}'"
+            raise ValueError(f"Bloco de {n} linha(s) comecando em {linhas[0]!r} achado "
+                             f"{len(achadas)} vez(es) em {onde}; esperado exatamente 1.")
+        cm.DeleteLines(achadas[0], n)
+        print(f"Bloco de {n} linha(s) removido de '{nome_modulo}' (linha {achadas[0]}).")
+        return achadas[0]
+
+    def remover_procedimento(self, nome_modulo, nome_proc, kind=0):
+        """Remove um procedimento inteiro, INCLUSIVE os comentarios e linhas vazias
+        acima dele que o VBE conta como parte do procedimento (ProcStartLine).
+        substituir_procedimento com texto vazio deixaria uma linha em branco."""
+        self._garantir_backup()
+        cm = self._achar(nome_modulo).CodeModule
+        inicio = cm.ProcStartLine(nome_proc, kind)
+        qtd = cm.ProcCountLines(nome_proc, kind)
+        cm.DeleteLines(inicio, qtd)
+        print(f"Procedimento '{nome_proc}' removido de '{nome_modulo}' "
+              f"(linhas {inicio}..{inicio + qtd - 1}).")
+
     def ler(self, nome_modulo, proc=None, numerar=False):
         """Imprime (e retorna) o codigo de um modulo ou de um procedimento.
 
@@ -1719,6 +1761,18 @@ def main(argv=None):
     sp.add_argument("--para", required=True, help="Linha(s) nova(s); o recuo e mantido.")
     sp.add_argument("--proc", help="Procura so dentro deste procedimento.")
 
+    sp = sub.add_parser("remover-bloco",
+                        help="Remove um bloco de linhas consecutivas (uma ocorrencia, sem caixa).")
+    sp.add_argument("--modulo", required=True)
+    sp.add_argument("--arquivo", required=True,
+                    help="Arquivo texto com as linhas do bloco, uma por linha (recuo ignorado).")
+    sp.add_argument("--proc", help="Procura so dentro deste procedimento.")
+
+    sp = sub.add_parser("remover-proc",
+                        help="Remove um procedimento inteiro, com o cabecalho de comentarios dele.")
+    sp.add_argument("--modulo", required=True)
+    sp.add_argument("--proc", required=True)
+
     sp = sub.add_parser("substituir-proc",
                         help="Substitui um procedimento inteiro pelo nome.")
     sp.add_argument("--modulo", required=True)
@@ -1788,7 +1842,8 @@ def main(argv=None):
     comandos_que_salvam = {"importar", "substituir", "editar", "adicionar",
                            "remover", "criar-form", "adicionar-controle",
                            "config-controle", "config-form", "corrigir-nomes", "trocar-linha",
-                           "substituir-proc", "adicionar-botao-planilha"}
+                           "substituir-proc", "adicionar-botao-planilha", "remover-bloco",
+                           "remover-proc"}
 
     # Comandos que nao salvam abrem o arquivo em somente-leitura: dispensa
     # fechar o workbook antes de rodar e contorna workbooks que recusam a
@@ -1826,6 +1881,12 @@ def main(argv=None):
                                   dentro_de=args.dentro_de, modelo=args.modelo)
         elif args.comando == "trocar-linha":
             ed.trocar_linha(args.modulo, args.de, args.para, proc=args.proc)
+        elif args.comando == "remover-bloco":
+            with open(args.arquivo, encoding="utf-8") as f:
+                linhas = f.read().replace("\r\n", "\n").rstrip("\n").split("\n")
+            ed.remover_bloco(args.modulo, linhas, proc=args.proc)
+        elif args.comando == "remover-proc":
+            ed.remover_procedimento(args.modulo, args.proc)
         elif args.comando == "substituir-proc":
             with open(args.codigo, "r", encoding="utf-8") as f:
                 ed.substituir_procedimento(args.modulo, args.proc, f.read(),

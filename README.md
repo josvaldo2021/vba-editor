@@ -28,6 +28,8 @@ python vba_editor.py "workbook.xlsm" adicionar --modulo frmVazio  --tipo form
 python vba_editor.py "workbook.xlsm" criar-form --spec form.json
 python vba_editor.py "workbook.xlsm" remover --modulo MeuModulo
 python vba_editor.py "workbook.xlsm" trocar-linha --modulo Mod1 --de "x = 1" --para "x = 2" --proc Calcular
+python vba_editor.py "workbook.xlsm" remover-bloco --modulo Mod1 --arquivo bloco.txt --proc Calcular
+python vba_editor.py "workbook.xlsm" remover-proc --modulo Mod1 --proc RotinaAntiga
 python vba_editor.py "workbook.xlsm" substituir-proc --modulo Mod1 --proc Calcular --codigo proc.txt --manter-cabecalho
 ```
 
@@ -162,3 +164,9 @@ with VBAEditor("workbook.xlsm") as ed:          # salva ao sair, só se não hou
 - `trocar_linha` casa a linha **inteira**, sem olhar caixa nem espaços de borda (o VBE
   re-capitaliza identificadores no projeto todo), mantém o recuo e **exige exatamente uma**
   ocorrência — no módulo ou só dentro de `proc`. Âncora ambígua é erro, não palpite.
+- `remover_bloco` desfaz um trecho que outra alteração inseriu: casa as linhas **consecutivas** uma a
+  uma (inteiras, sem caixa nem espaços de borda) e exige **exatamente uma** ocorrência do bloco.
+  Existe porque restaurar o procedimento inteiro de um commit antigo desfaria também as correções
+  feitas nele depois (pcp_brglass, fatia 083: o `Dados.bas` tinha uma tabela corrigida no meio).
+- `remover_procedimento` apaga o procedimento **com** os comentários e linhas vazias de cima (o que o
+  VBE conta como parte dele); `substituir_procedimento` com texto vazio deixaria uma linha em branco.
