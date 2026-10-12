@@ -1255,6 +1255,51 @@ class VBAEditor:
               f"planilha '{ws.Name}' (OnAction={botao.OnAction}).")
         return botao.Name
 
+    def adicionar_forma_planilha(self, aba, nome, texto, on_action, left, top,
+                                 width, height, modelo, texto_props=None):
+        """Cria (ou atualiza) um botao FORMA numa planilha, copiando o estilo
+        de uma forma que ja existe na mesma aba (`modelo`).
+
+        Existe porque as abas de trabalho usam formas arredondadas coloridas
+        como botao (o "..." e o "Estoque PVB" do pcp_brglass): um botao de
+        formulario cinza destoa. Duplicar o modelo leva preenchimento, borda,
+        sombra, fonte e alinhamento sem enumerar propriedade por propriedade.
+
+        Idempotente por `nome`: se a forma ja existe, so atualiza posicao,
+        texto e OnAction -- rodar o driver duas vezes deixa UMA forma.
+
+        texto_props: propriedades do TEXTO (TextFrame2.TextRange), para quando
+        o modelo serve no estilo mas nao na letra -- ex.: o "..." tem fonte 28
+        e o texto de um botao pede 10: {"Font.Size": 10, "Font.Bold": True,
+        "ParagraphFormat.Alignment": 2}.
+        """
+        ws = self._planilha(aba)
+        forma = None
+        ref = None
+        for sh in ws.Shapes:
+            if sh.Name.lower() == str(nome).lower():
+                forma = sh
+            if sh.Name.lower() == str(modelo).lower():
+                ref = sh
+        if forma is None and ref is None:
+            existentes = ", ".join(sh.Name for sh in ws.Shapes)
+            raise KeyError(f"A aba '{ws.Name}' nao tem a forma modelo '{modelo}'. "
+                           f"Tem: {existentes}.")
+        self._garantir_backup()
+        criado = forma is None
+        if criado:
+            forma = ref.Duplicate()
+            forma.Name = nome
+        forma.Left, forma.Top = float(left), float(top)
+        forma.Width, forma.Height = float(width), float(height)
+        forma.TextFrame2.TextRange.Text = texto
+        if texto_props:
+            self._aplicar_props(forma.TextFrame2.TextRange, texto_props)
+        forma.OnAction = on_action
+        print(f"Forma '{forma.Name}' {'criada' if criado else 'atualizada'} na "
+              f"planilha '{ws.Name}' (modelo={modelo}, OnAction={forma.OnAction}).")
+        return forma.Name
+
     def remover(self, nome_modulo):
         """Remove um modulo. Documentos (planilhas/ThisWorkbook) nao podem ser removidos."""
         comp = self._achar(nome_modulo)
@@ -1806,6 +1851,21 @@ def main(argv=None):
     sp.add_argument("--width", type=float, required=True)
     sp.add_argument("--height", type=float, required=True)
 
+    sp = sub.add_parser("adicionar-forma-planilha",
+                        help="Cria/atualiza um botao FORMA numa planilha, copiando o "
+                             "estilo de uma forma existente, com OnAction para uma macro.")
+    sp.add_argument("--aba", required=True, help="Nome da aba ou CodeName (ex.: Plan25).")
+    sp.add_argument("--nome", required=True, help="Nome da forma (chave da idempotencia).")
+    sp.add_argument("--texto", required=True, help="Texto exibido na forma.")
+    sp.add_argument("--on-action", required=True, help="Macro chamada no clique.")
+    sp.add_argument("--modelo", required=True, help="Forma da mesma aba cujo estilo e copiado.")
+    sp.add_argument("--texto-props", default=None,
+                    help='JSON com propriedades do texto, ex.: {"Font.Size": 10, "Font.Bold": true}.')
+    sp.add_argument("--left", type=float, required=True)
+    sp.add_argument("--top", type=float, required=True)
+    sp.add_argument("--width", type=float, required=True)
+    sp.add_argument("--height", type=float, required=True)
+
     sp = sub.add_parser("remover", help="Remove um modulo.")
     sp.add_argument("--modulo", required=True)
 
@@ -1843,7 +1903,7 @@ def main(argv=None):
                            "remover", "criar-form", "adicionar-controle",
                            "config-controle", "config-form", "corrigir-nomes", "trocar-linha",
                            "substituir-proc", "adicionar-botao-planilha", "remover-bloco",
-                           "remover-proc"}
+                           "remover-proc", "adicionar-forma-planilha"}
 
     # Comandos que nao salvam abrem o arquivo em somente-leitura: dispensa
     # fechar o workbook antes de rodar e contorna workbooks que recusam a
@@ -1899,6 +1959,11 @@ def main(argv=None):
         elif args.comando == "adicionar-botao-planilha":
             ed.adicionar_botao_planilha(args.aba, args.nome, args.texto, args.on_action,
                                         args.left, args.top, args.width, args.height)
+        elif args.comando == "adicionar-forma-planilha":
+            ed.adicionar_forma_planilha(args.aba, args.nome, args.texto, args.on_action,
+                                        args.left, args.top, args.width, args.height,
+                                        args.modelo,
+                                        json.loads(args.texto_props) if args.texto_props else None)
         elif args.comando == "remover":
             ed.remover(args.modulo)
         elif args.comando == "ler":
