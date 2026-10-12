@@ -1328,6 +1328,7 @@ class VBAEditor:
         """
         novo_codigo, removidas = _tirar_cabecalho_export(novo_codigo)
         self._recusar_reservadas(novo_codigo, nome_modulo)
+        self._recusar_global_colidente(nome_modulo, novo_codigo)
         self._garantir_backup()
         cm = self._achar(nome_modulo).CodeModule
         if cm.CountOfLines > 0:
@@ -1344,6 +1345,7 @@ class VBAEditor:
     def adicionar_codigo(self, nome_modulo, codigo):
         """Anexa codigo (string) ao final de um modulo existente."""
         self._recusar_reservadas(codigo, nome_modulo)
+        self._recusar_global_colidente(nome_modulo, codigo, anexar=True)
         self._garantir_backup()
         cm = self._achar(nome_modulo).CodeModule
         cm.InsertLines(cm.CountOfLines + 1, codigo)
@@ -1377,6 +1379,87 @@ class VBAEditor:
                 f"Codigo para '{onde}' usa palavra reservada do VBA como nome ({lista}). "
                 "Isso da 'Erro de sintaxe' so na compilacao do procedimento. Renomeie. "
                 "(Para forcar, ed.checar_reservadas = False.)")
+
+    # Liga/desliga a recusa de nome Public NOVO de modulo padrao que ja aparece
+    # como identificador em outro componente.
+    checar_globais = True
+
+    _RE_PUBLICO_BAS = re.compile(
+        r"^\s*(?:(?:Public|Global)\s+)?(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+(\w+)"
+        r"|^\s*(?:Public|Global)\s+(?:Const\s+)?(\w+)", re.IGNORECASE | re.MULTILINE)
+
+    @classmethod
+    def _publicos_de_bas(cls, codigo):
+        nomes = set()
+        for linha in codigo.replace("\r\n", "\n").split("\n"):
+            s = linha.lstrip()
+            if s.lower().startswith(("private ", "dim ", "'", "rem ", "declare ", "public declare ")):
+                continue
+            m = cls._RE_PUBLICO_BAS.match(linha)
+            if m:
+                n = m.group(1) or m.group(2)
+                if n and n.lower() not in ("sub", "function", "property", "const", "enum", "type",
+                                           "withevents"):
+                    nomes.add(n)
+        return nomes
+
+    @staticmethod
+    def _sem_comentario_nem_texto(codigo):
+        out = []
+        for linha in codigo.replace("\r\n", "\n").split("\n"):
+            limpo, dentro = [], False
+            for ch in linha:
+                if ch == '"':
+                    dentro = not dentro
+                    continue
+                if ch == "'" and not dentro:
+                    break
+                if not dentro:
+                    limpo.append(ch)
+            out.append("".join(limpo))
+        return "\n".join(out)
+
+    def _recusar_global_colidente(self, nome_modulo, codigo, anexar=False):
+        """Recusa ANTES de gravar um nome Public NOVO de modulo padrao que outro
+        componente ja usa como identificador (variavel local, por exemplo).
+
+        Procedimento Public de .bas tem escopo GLOBAL: se o legado tem uma
+        variavel `SaldoLap` sem Dim (ou com Dim em outro escopo), uma Function
+        global `SaldoLap` nova passa a ser chamada no lugar dela, e o erro
+        ("O argumento nao e opcional") aparece no modulo LEGADO, so ao compilar.
+        Caso real: fatia 101 do pcp_brglass, pego pelo `verificar` em 12/10/2026.
+        """
+        if not self.checar_globais:
+            return
+        comp = self._achar(nome_modulo)
+        if comp.Type != VBEXT_CT_STD_MODULE:
+            return
+        atual = self.ler_codigo(nome_modulo)
+        novos = self._publicos_de_bas(codigo)
+        ja_tinha = {n.lower() for n in self._publicos_de_bas(atual)}
+        novos = {n for n in novos if n.lower() not in ja_tinha}
+        if not novos:
+            return
+        padroes = {n: re.compile(r"\b%s\b" % re.escape(n), re.IGNORECASE) for n in novos}
+        achados = {}
+        for c in self._componentes:
+            if c.Name.lower() == comp.Name.lower():
+                continue
+            cm = c.CodeModule
+            if cm.CountOfLines == 0:
+                continue
+            texto = self._sem_comentario_nem_texto(cm.Lines(1, cm.CountOfLines))
+            for n, p in padroes.items():
+                if p.search(texto):
+                    achados.setdefault(n, []).append(c.Name)
+        if achados:
+            lista = "; ".join(f"'{n}' ja aparece em {', '.join(sorted(m)[:5])}"
+                              + (" ..." if len(m) > 5 else "") for n, m in sorted(achados.items()))
+            raise ValueError(
+                f"Codigo para '{nome_modulo}' cria nome(s) Public novo(s) de escopo global que outro "
+                f"componente ja usa ({lista}). O VBA passaria a resolver o nome antigo para o novo e o "
+                "erro so apareceria ao compilar o modulo antigo. Renomeie "
+                "(ou, se o uso for intencional, ed.checar_globais = False).")
 
     def substituir_procedimento(self, nome_modulo, nome_proc, novo_codigo, kind=0,
                                 manter_cabecalho=False):
