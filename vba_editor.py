@@ -1428,6 +1428,11 @@ class VBAEditor:
         global `SaldoLap` nova passa a ser chamada no lugar dela, e o erro
         ("O argumento nao e opcional") aparece no modulo LEGADO, so ao compilar.
         Caso real: fatia 101 do pcp_brglass, pego pelo `verificar` em 12/10/2026.
+
+        So conta como colisao o nome DECLARADO (Dim/Static/Const/parametro/For,
+        inclusive na lista "Dim a As X, nome As Y") ou ALVO DE ATRIBUICAO
+        ("nome = ...", ": nome = 0", "nome(i) = ..."): CHAMAR o procedimento
+        novo e o uso esperado (os forms da propria fatia chamam a fabrica).
         """
         if not self.checar_globais:
             return
@@ -1440,7 +1445,15 @@ class VBAEditor:
         novos = {n for n in novos if n.lower() not in ja_tinha}
         if not novos:
             return
-        padroes = {n: re.compile(r"\b%s\b" % re.escape(n), re.IGNORECASE) for n in novos}
+        padroes = {}
+        for n in novos:
+            e = re.escape(n)
+            padroes[n] = re.compile(
+                r"\b(?:Dim|Static|Private|Public|Global|Const|ReDim|ByVal|ByRef|Optional|ParamArray|For)"
+                r"\s+(?:Preserve\s+|Each\s+)?%s\b"
+                r"|,\s*%s\s+As\b"
+                r"|(?:^|:)\s*(?:Set\s+|Let\s+)?%s\s*(?:\([^)]*\))?\s*=" % (e, e, e),
+                re.IGNORECASE | re.MULTILINE)
         achados = {}
         for c in self._componentes:
             if c.Name.lower() == comp.Name.lower():
