@@ -16,6 +16,8 @@ Usa pywin32 (win32com) para controlar o Excel e acessar o VBProject de um arquiv
     (criar-form so monta form novo; recriar um form perderia layout e .frx)
   - config-controle : alterar propriedades de um controle ja existente
     (legenda, posicao, tamanho) sem remover e recriar
+  - remover-controle : tirar um controle de um UserForm (recusa se o
+    codigo ainda o cita)
   - remover   : apagar um modulo
   - listar    : mostrar os modulos existentes
   - ler       : imprimir o codigo de um modulo (ou de um procedimento)
@@ -1196,6 +1198,64 @@ class VBAEditor:
               f"({len(props)} propriedade(s)).")
         return alvo.Name
 
+    def remover_controle(self, nome_form, nome_controle):
+        """Remove um controle do Designer de um UserForm que JA EXISTE.
+
+        Complementa adicionar_controle(): sem isto, tirar um campo de uma tela
+        pronta exigiria esconde-lo (Visible=False), deixando controle morto no
+        .frx. Recusa, antes de mexer:
+          - controle inexistente;
+          - container (Frame, MultiPage) que ainda tem filhos;
+          - nome ainda CITADO no codigo do form (fora de comentario e de
+            texto, sem caixa), inclusive como evento (nome_Change): remover o
+            controle antes do codigo deixaria o form sem compilar.
+        """
+        comp = self._achar(nome_form)
+        if comp.Type != VBEXT_CT_MSFORM:
+            raise ValueError(
+                f"'{nome_form}' nao e um UserForm (Type={comp.Type})."
+            )
+        designer = comp.Designer
+        alvo = self._controle_do_form(designer, nome_controle, comp.Name)
+        nome = alvo.Name
+
+        try:
+            filhos = alvo.Controls.Count
+        except Exception:
+            filhos = 0
+        if filhos:
+            raise ValueError(
+                f"'{nome}' e um container com {filhos} controle(s) dentro. "
+                "Remova os filhos antes."
+            )
+
+        cm = comp.CodeModule
+        codigo = cm.Lines(1, cm.CountOfLines) if cm.CountOfLines else ""
+        limpo = self._sem_comentario_nem_texto(codigo)
+        # Antes do nome: nada de letra, digito ou "_". Depois: nada de letra
+        # ou digito -- "_" e permitido de proposito, para pegar nome_Change.
+        padrao = r"(?<![A-Za-z0-9_])" + re.escape(nome) + r"(?![A-Za-z0-9])"
+        citacoes = [i + 1 for i, linha in enumerate(limpo.split("\n"))
+                    if re.search(padrao, linha, re.IGNORECASE)]
+        if citacoes:
+            raise ValueError(
+                f"O codigo de '{comp.Name}' ainda cita '{nome}' "
+                f"(linha(s) {', '.join(map(str, citacoes[:10]))}). "
+                "Remova o codigo antes do controle."
+            )
+
+        self._garantir_backup()
+        try:
+            container = alvo.Parent
+            container.Controls.Remove(nome)
+        except Exception:
+            designer.Controls.Remove(nome)
+        for c in designer.Controls:
+            if c.Name.lower() == nome.lower():
+                raise RuntimeError(f"'{nome}' continua no form depois do Remove.")
+        print(f"Controle '{nome}' removido do form '{comp.Name}'.")
+        return nome
+
     def configurar_form(self, nome_form, props):
         """Altera propriedades do PROPRIO UserForm (Height, Width, Caption...).
 
@@ -1935,6 +1995,12 @@ def main(argv=None):
     sp.add_argument("--propriedades", required=True,
                     help="JSON com as propriedades a alterar.")
 
+    sp = sub.add_parser("remover-controle",
+                        help="Remove um controle de um UserForm existente "
+                             "(recusa se o codigo ainda o cita).")
+    sp.add_argument("--modulo", required=True, help="UserForm que contem o controle.")
+    sp.add_argument("--nome", required=True, help="Nome do controle a remover.")
+
     sp = sub.add_parser("adicionar-botao-planilha",
                         help="Cria/atualiza um botao de formulario numa planilha, "
                              "com OnAction para uma macro.")
@@ -1999,7 +2065,7 @@ def main(argv=None):
                            "remover", "criar-form", "adicionar-controle",
                            "config-controle", "config-form", "corrigir-nomes", "trocar-linha",
                            "substituir-proc", "adicionar-botao-planilha", "remover-bloco",
-                           "remover-proc", "adicionar-forma-planilha"}
+                           "remover-proc", "adicionar-forma-planilha", "remover-controle"}
 
     # Comandos que nao salvam abrem o arquivo em somente-leitura: dispensa
     # fechar o workbook antes de rodar e contorna workbooks que recusam a
@@ -2052,6 +2118,8 @@ def main(argv=None):
         elif args.comando == "config-controle":
             ed.configurar_controle(args.modulo, args.nome,
                                    json.loads(args.propriedades))
+        elif args.comando == "remover-controle":
+            ed.remover_controle(args.modulo, args.nome)
         elif args.comando == "adicionar-botao-planilha":
             ed.adicionar_botao_planilha(args.aba, args.nome, args.texto, args.on_action,
                                         args.left, args.top, args.width, args.height)
