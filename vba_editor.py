@@ -956,7 +956,45 @@ class VBAEditor:
         if not os.path.exists(caminho_arquivo):
             raise FileNotFoundError(caminho_arquivo)
         self._garantir_backup()
-        comp = self._componentes.Import(caminho_arquivo)
+        # O VBE so reconhece o cabecalho (VERSION/BEGIN/Attribute) com CRLF. Com LF
+        # puro um .cls entra como MODULO PADRAO com o cabecalho virando codigo: erro
+        # de sintaxe de nivel de modulo que faz o Application.Run nao achar NENHUMA
+        # macro do projeto (prototipo produto a produto, 08/11/2026). Normaliza numa
+        # copia temporaria (com o .frx junto, se houver).
+        import tempfile, shutil
+        ext = os.path.splitext(caminho_arquivo)[1].lower()
+        with open(caminho_arquivo, "rb") as f:
+            bruto = f.read()
+        origem = caminho_arquivo
+        tmpdir = None
+        if b"\n" in bruto.replace(b"\r\n", b""):
+            tmpdir = tempfile.mkdtemp(prefix="vba_import_")
+            origem = os.path.join(tmpdir, os.path.basename(caminho_arquivo))
+            with open(origem, "wb") as f:
+                f.write(bruto.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+            frx = os.path.splitext(caminho_arquivo)[0] + ".frx"
+            if ext == ".frm" and os.path.exists(frx):
+                shutil.copy2(frx, os.path.join(tmpdir, os.path.basename(frx)))
+            print("  [aviso] arquivo com quebra de linha LF; importado convertido para CRLF.")
+        try:
+            comp = self._componentes.Import(origem)
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        # Confere o tipo e que o cabecalho nao virou codigo; senao desfaz e recusa.
+        esperado = {".bas": VBEXT_CT_STD_MODULE, ".cls": VBEXT_CT_CLASS_MODULE,
+                    ".frm": VBEXT_CT_MSFORM}.get(ext)
+        cm = comp.CodeModule
+        topo = cm.Lines(1, min(cm.CountOfLines, 15)) if cm.CountOfLines else ""
+        lixo = [l for l in topo.splitlines()
+                if re.match(r"\s*(VERSION\s+\d|BEGIN\b|Attribute\s+VB_)", l, re.I)]
+        if (esperado is not None and comp.Type != esperado) or lixo:
+            nome, tipo = comp.Name, comp.Type
+            self._componentes.Remove(comp)
+            raise RuntimeError(
+                f"Importacao de '{caminho_arquivo}' saiu errada (tipo {tipo}"
+                f" esperado {esperado}; cabecalho como codigo: {lixo[:2]}). "
+                f"Componente '{nome}' removido; confira o cabecalho do arquivo.")
         print(f"Modulo '{comp.Name}' importado de '{caminho_arquivo}'.")
         return comp.Name
 
