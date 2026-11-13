@@ -2048,6 +2048,27 @@ class PacoteRibbon:
         return infos, dados
 
     @staticmethod
+    def _copiar_cru(fonte, info, zout):
+        """Copia uma entrada do zip sem descomprimir (bytes comprimidos originais)."""
+        import copy
+        import struct
+        fonte.seek(info.header_offset)
+        cab = fonte.read(30)
+        if cab[:4] != b"PK\x03\x04":
+            raise RuntimeError("Cabecalho local invalido em %s" % info.filename)
+        n, e = struct.unpack("<HH", cab[26:30])
+        fonte.seek(info.header_offset + 30 + n + e)
+        cru = fonte.read(info.compress_size)
+        zi = copy.copy(info)
+        zi.flag_bits &= ~0x08          # tamanhos e CRC vao no cabecalho local (sem descritor)
+        zi.header_offset = zout.fp.tell()
+        zout.fp.write(zi.FileHeader())
+        zout.fp.write(cru)
+        zout.filelist.append(zi)
+        zout.NameToInfo[zi.filename] = zi
+        zout.start_dir = zout.fp.tell()
+
+    @staticmethod
     def _parte_ribbon(dados):
         import xml.etree.ElementTree as ET
         rels = ET.fromstring(dados["_rels/.rels"])
@@ -2172,15 +2193,24 @@ class PacoteRibbon:
         # --- grava (temporario + troca) ---
         self._garantir_backup()
         tmp = self.caminho + ".ribbon.tmp"
-        with zipfile.ZipFile(tmp, "w") as zout:
+        # As partes que NAO mudam vao byte a byte, ainda comprimidas: o Excel grava
+        # com deflate "super rapido" e recomprimir com o zlib do Python mudava o
+        # arquivo inteiro (-437 KB no pcp_brglass, sem mudar conteudo nenhum).
+        with zipfile.ZipFile(tmp, "w") as zout, open(self.caminho, "rb") as fonte:
             for info in infos:
-                zout.writestr(info, novos.pop(info.filename, dados[info.filename]))
+                if info.filename in novos:
+                    zout.writestr(info, novos.pop(info.filename))
+                else:
+                    self._copiar_cru(fonte, info, zout)
             for nome, conteudo in novos.items():
                 zout.writestr(nome, conteudo, compress_type=zipfile.ZIP_DEFLATED)
         with zipfile.ZipFile(tmp) as zt:
-            if zt.testzip() is not None:
+            ruim = zt.testzip()
+            iguais = all(zt.read(i.filename) == dados[i.filename] for i in infos
+                         if i.filename not in (parte, rels_nome, "[Content_Types].xml"))
+            if ruim is not None or not iguais:
                 os.remove(tmp)
-                raise RuntimeError("O pacote gravado ficou corrompido; original intacto.")
+                raise RuntimeError("O pacote gravado nao confere (%s); original intacto." % (ruim or "conteudo"))
         os.replace(tmp, self.caminho)
         print(f"  [ok] botao '{id_botao}' adicionado a ribbon ({parte}).")
         return novo_xml
