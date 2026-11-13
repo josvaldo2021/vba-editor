@@ -1353,8 +1353,66 @@ class VBAEditor:
               f"planilha '{ws.Name}' (OnAction={botao.OnAction}).")
         return botao.Name
 
+    CARACTERES_PROIBIDOS_ABA = set(':\\/?*[]')
+
+    def adicionar_aba(self, nome, depois_de=None):
+        """Cria uma planilha nova com o nome dado e devolve o CodeName dela.
+
+        Existe porque criar aba por um driver COM caseiro pularia o backup, a
+        checagem de lock e o resto do abrir() (regra do pcp_brglass). Recusa
+        (antes de mexer no arquivo):
+        - nome vazio, com mais de 31 caracteres (limite do Excel), nao-ASCII
+          (os nomes de aba sao cadastrados num banco e comparados por igualdade:
+          acento vira divergencia) ou com : \\ / ? * [ ];
+        - nome que ja existe (sem caixa, como o Excel compara);
+        - pasta com a ESTRUTURA protegida.
+        `depois_de`: aba (nome ou CodeName) apos a qual inserir; padrao = ultima.
+        """
+        nome = str(nome or "").strip()
+        if not nome:
+            raise ValueError("Nome de aba vazio.")
+        if len(nome) > 31:
+            raise ValueError(f"Nome de aba com {len(nome)} caracteres: o Excel aceita no maximo 31.")
+        if any(ord(c) > 127 for c in nome):
+            raise ValueError(f"Nome de aba '{nome}' tem caractere nao-ASCII.")
+        ruins = sorted(set(nome) & self.CARACTERES_PROIBIDOS_ABA)
+        if ruins:
+            raise ValueError(f"Nome de aba '{nome}' tem caractere proibido: {''.join(ruins)}")
+        for ws in self.wb.Worksheets:
+            if ws.Name.lower() == nome.lower():
+                raise ValueError(f"Ja existe a aba '{ws.Name}' ({ws.CodeName}).")
+        if self.wb.ProtectStructure:
+            raise ValueError("A estrutura da pasta esta protegida: nao da para criar aba.")
+        ref = self._planilha(depois_de) if depois_de else self.wb.Worksheets(self.wb.Worksheets.Count)
+        self._garantir_backup()
+        nomes_antes = {self._componentes.Item(i).Name
+                       for i in range(1, self._componentes.Count + 1)}
+        n_antes = len(nomes_antes)
+        # posicional (Before=None, After=ref): medido 13/11/2026, com After= nomeado
+        # pelo pywin32 a aba caiu no meio da pasta, longe de `ref`.
+        ws = self.wb.Worksheets.Add(None, ref)
+        ws.Name = nome
+        # O CodeName de aba criada por automacao vem VAZIO (medido 13/11/2026)
+        # ate o VBE enxergar o componente; o componente novo e o documento que
+        # nao existia antes. Relê a colecao (handles velhos invalidam, licao 071).
+        codigo = ws.CodeName
+        if not codigo:
+            comps = self.wb.VBProject.VBComponents
+            novos = [comps.Item(i).Name for i in range(1, comps.Count + 1)
+                     if comps.Item(i).Name not in nomes_antes
+                     and comps.Item(i).Type == VBEXT_CT_DOCUMENT]
+            if len(novos) != 1:
+                raise RuntimeError(f"Aba criada, mas o componente novo e ambiguo: {novos}")
+            codigo = novos[0]
+        anterior = ws.Previous.Name if ws.Index > 1 else "(nenhuma)"
+        if anterior != ref.Name:
+            raise RuntimeError(f"Aba criada depois de '{anterior}', nao de '{ref.Name}'.")
+        print(f"Aba '{ws.Name}' criada depois de '{anterior}' (CodeName={codigo}; "
+              f"componentes {n_antes} -> {n_antes + 1}).")
+        return codigo
+
     def adicionar_forma_planilha(self, aba, nome, texto, on_action, left, top,
-                                 width, height, modelo, texto_props=None):
+                                 width, height, modelo, texto_props=None, aba_modelo=None):
         """Cria (ou atualiza) um botao FORMA numa planilha, copiando o estilo
         de uma forma que ja existe na mesma aba (`modelo`).
 
@@ -1370,23 +1428,36 @@ class VBAEditor:
         o modelo serve no estilo mas nao na letra -- ex.: o "..." tem fonte 28
         e o texto de um botao pede 10: {"Font.Size": 10, "Font.Bold": True,
         "ParagraphFormat.Alignment": 2}.
+
+        aba_modelo: aba onde esta o `modelo`, quando nao e a mesma (aba nova,
+        sem forma nenhuma). A forma e criada com o mesmo tipo de AutoShape e o
+        estilo vem por PickUp/Apply (preenchimento, borda, sombra); a letra vai
+        por texto_props.
         """
         ws = self._planilha(aba)
+        ws_ref = self._planilha(aba_modelo) if aba_modelo else ws
         forma = None
         ref = None
         for sh in ws.Shapes:
             if sh.Name.lower() == str(nome).lower():
                 forma = sh
+        for sh in ws_ref.Shapes:
             if sh.Name.lower() == str(modelo).lower():
                 ref = sh
         if forma is None and ref is None:
-            existentes = ", ".join(sh.Name for sh in ws.Shapes)
-            raise KeyError(f"A aba '{ws.Name}' nao tem a forma modelo '{modelo}'. "
+            existentes = ", ".join(sh.Name for sh in ws_ref.Shapes)
+            raise KeyError(f"A aba '{ws_ref.Name}' nao tem a forma modelo '{modelo}'. "
                            f"Tem: {existentes}.")
         self._garantir_backup()
         criado = forma is None
-        if criado:
+        if criado and ws_ref.Name == ws.Name:
             forma = ref.Duplicate()
+            forma.Name = nome
+        elif criado:
+            forma = ws.Shapes.AddShape(ref.AutoShapeType, float(left), float(top),
+                                       float(width), float(height))
+            ref.PickUp()
+            forma.Apply()
             forma.Name = nome
         forma.Left, forma.Top = float(left), float(top)
         forma.Width, forma.Height = float(width), float(height)
@@ -2058,13 +2129,20 @@ def main(argv=None):
     sp.add_argument("--nome", required=True, help="Nome da forma (chave da idempotencia).")
     sp.add_argument("--texto", required=True, help="Texto exibido na forma.")
     sp.add_argument("--on-action", required=True, help="Macro chamada no clique.")
-    sp.add_argument("--modelo", required=True, help="Forma da mesma aba cujo estilo e copiado.")
+    sp.add_argument("--modelo", required=True, help="Forma cujo estilo e copiado.")
+    sp.add_argument("--aba-modelo", default=None,
+                    help="Aba onde esta o modelo, se nao for a mesma (ex.: aba nova sem formas).")
     sp.add_argument("--texto-props", default=None,
                     help='JSON com propriedades do texto, ex.: {"Font.Size": 10, "Font.Bold": true}.')
     sp.add_argument("--left", type=float, required=True)
     sp.add_argument("--top", type=float, required=True)
     sp.add_argument("--width", type=float, required=True)
     sp.add_argument("--height", type=float, required=True)
+
+    sp = sub.add_parser("adicionar-aba",
+                        help="Cria uma planilha nova (nome ASCII, ate 31 caracteres, inedito).")
+    sp.add_argument("--nome", required=True, help="Nome da aba nova.")
+    sp.add_argument("--depois-de", default=None, help="Aba apos a qual inserir (padrao: a ultima).")
 
     sp = sub.add_parser("remover", help="Remove um modulo.")
     sp.add_argument("--modulo", required=True)
@@ -2103,7 +2181,8 @@ def main(argv=None):
                            "remover", "criar-form", "adicionar-controle",
                            "config-controle", "config-form", "corrigir-nomes", "trocar-linha",
                            "substituir-proc", "adicionar-botao-planilha", "remover-bloco",
-                           "remover-proc", "adicionar-forma-planilha", "remover-controle"}
+                           "remover-proc", "adicionar-forma-planilha", "remover-controle",
+                           "adicionar-aba"}
 
     # Comandos que nao salvam abrem o arquivo em somente-leitura: dispensa
     # fechar o workbook antes de rodar e contorna workbooks que recusam a
@@ -2165,7 +2244,10 @@ def main(argv=None):
             ed.adicionar_forma_planilha(args.aba, args.nome, args.texto, args.on_action,
                                         args.left, args.top, args.width, args.height,
                                         args.modelo,
-                                        json.loads(args.texto_props) if args.texto_props else None)
+                                        json.loads(args.texto_props) if args.texto_props else None,
+                                        aba_modelo=args.aba_modelo)
+        elif args.comando == "adicionar-aba":
+            ed.adicionar_aba(args.nome, depois_de=args.depois_de)
         elif args.comando == "remover":
             ed.remover(args.modulo)
         elif args.comando == "ler":
