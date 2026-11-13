@@ -25,6 +25,8 @@ Usa pywin32 (win32com) para controlar o Excel e acessar o VBProject de um arquiv
   - verificar : compilar o projeto VBA e informar se ha erro
   - corrigir-nomes : remover nomes '_FilterDatabase' duplicados (causa do
     dialogo 'Conflito de nome' que trava a abertura via automacao)
+  - ribbon-ler / ribbon-adicionar-botao : ler e acrescentar botao na ribbon
+    personalizada (customUI.xml, no pacote zip; o Excel nao e aberto)
 
 Os dialogos modais exibidos durante o Open sao respondidos automaticamente
 por uma thread vigia (ver _vigiar_dialogos_conflito):
@@ -2008,6 +2010,195 @@ class VBAEditor:
 # ----------------------------------------------------------------------
 # Interface de linha de comando
 # ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Ribbon (customUI) -- parte do PACOTE zip, fora do alcance do VBE/COM
+# ---------------------------------------------------------------------------
+_REL_RIBBON = ("http://schemas.microsoft.com/office/2006/relationships/ui/extensibility",
+               "http://schemas.microsoft.com/office/2007/relationships/ui/extensibility")
+_REL_IMAGEM = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+
+class PacoteRibbon:
+    """Le e altera a ribbon personalizada (customUI.xml) de um .xlsm.
+
+    A ribbon nao e codigo VBA: mora no zip do arquivo (customUI/customUI.xml,
+    imagens em customUI/images, relacoes em customUI/_rels). O Excel por COM
+    nao a edita, entao esta classe mexe no pacote com o arquivo FECHADO, com as
+    mesmas garantias do abrir(): recusa se houver lock '~$' e faz backup datado
+    em backups/ antes de gravar. O XML e alterado por INSERCAO de texto (a
+    formatacao e os prefixos originais ficam intactos) e o resultado e
+    conferido por um parser antes de gravar. Grava num temporario e troca.
+    """
+
+    def __init__(self, caminho, auto_backup=True, pasta_backup="backups"):
+        self.caminho = os.path.abspath(caminho)
+        self.auto_backup = auto_backup
+        self.pasta_backup = pasta_backup
+        self._fez_backup = False
+
+    # reaproveita as regras do VBAEditor (mesma mensagem, mesmo nome de backup)
+    _verificar_lock = VBAEditor._verificar_lock
+    _garantir_backup = VBAEditor._garantir_backup
+
+    def _ler_pacote(self):
+        import zipfile
+        with zipfile.ZipFile(self.caminho) as z:
+            infos = z.infolist()
+            dados = {i.filename: z.read(i.filename) for i in infos}
+        return infos, dados
+
+    @staticmethod
+    def _parte_ribbon(dados):
+        import xml.etree.ElementTree as ET
+        rels = ET.fromstring(dados["_rels/.rels"])
+        for r in rels:
+            if r.get("Type") in _REL_RIBBON:
+                return r.get("Target").lstrip("/")
+        return None
+
+    def ler_ribbon(self):
+        """Devolve o XML da ribbon (texto) ou None se o arquivo nao tiver."""
+        _, dados = self._ler_pacote()
+        parte = self._parte_ribbon(dados)
+        return None if parte is None else dados[parte].decode("utf-8")
+
+    def adicionar_botao_ribbon(self, id_botao, label, on_action, tag=None,
+                               depois_de=None, grupo=None, separador=True,
+                               size="large", imagem=None, imagem_mso=None,
+                               id_imagem=None):
+        """Acrescenta um <button> a um grupo da ribbon.
+
+        depois_de: id do controle apos o qual inserir; sem ele, vai para o fim
+        do grupo `grupo` (id). separador: poe um <separator> antes do botao.
+        imagem: caminho de um PNG, gravado em customUI/images com a relacao
+        `id_imagem` (padrao: 'img_' + id_botao); ou imagem_mso: icone embutido
+        do Office. Recusa id repetido (de controle ou de imagem).
+        """
+        import zipfile
+        import xml.etree.ElementTree as ET
+        from xml.sax.saxutils import quoteattr
+        self._verificar_lock()
+        if imagem and imagem_mso:
+            raise ValueError("Use imagem OU imagem_mso, nao os dois.")
+        if (depois_de is None) == (grupo is None):
+            raise ValueError("Informe depois_de (id de um controle) OU grupo (id do grupo).")
+        infos, dados = self._ler_pacote()
+        parte = self._parte_ribbon(dados)
+        if parte is None:
+            raise RuntimeError("O arquivo nao tem ribbon personalizada (customUI).")
+        xml = dados[parte].decode("utf-8")
+        raiz = ET.fromstring(xml)
+        ids = {e.get("id") for e in raiz.iter() if e.get("id")}
+        if id_botao in ids:
+            raise ValueError(f"Ja existe um controle com id '{id_botao}' na ribbon.")
+
+        # --- imagem ---
+        pasta_ui = os.path.dirname(parte)
+        rels_nome = (pasta_ui + "/" if pasta_ui else "") + "_rels/" + os.path.basename(parte) + ".rels"
+        novos = {}
+        atrib_img = ""
+        if imagem:
+            id_imagem = id_imagem or ("img_" + id_botao)
+            if not os.path.isfile(imagem) or not imagem.lower().endswith(".png"):
+                raise ValueError(f"Imagem PNG nao encontrada: {imagem}")
+            rels_xml = dados.get(rels_nome, (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                'relationships"></Relationships>').encode("utf-8")).decode("utf-8")
+            if {r.get("Id") for r in ET.fromstring(rels_xml)} & {id_imagem}:
+                raise ValueError(f"Ja existe uma imagem com id '{id_imagem}' na ribbon.")
+            alvo = "images/" + id_imagem + ".png"
+            nome_img = (pasta_ui + "/" if pasta_ui else "") + alvo
+            if nome_img in dados:
+                raise ValueError(f"Ja existe a parte {nome_img} no pacote.")
+            with open(imagem, "rb") as f:
+                novos[nome_img] = f.read()
+            rel = ('<Relationship Id=%s Type="%s" Target="%s"/>'
+                   % (quoteattr(id_imagem), _REL_IMAGEM, alvo))
+            novos[rels_nome] = rels_xml.replace("</Relationships>", rel + "</Relationships>", 1).encode("utf-8")
+            tipos = dados["[Content_Types].xml"].decode("utf-8")
+            if not re.search(r'Extension="png"', tipos, re.I):
+                novos["[Content_Types].xml"] = tipos.replace(
+                    "<Default ", '<Default Extension="png" ContentType="image/png"/><Default ', 1).encode("utf-8")
+            atrib_img = "image=" + quoteattr(id_imagem)
+        elif imagem_mso:
+            atrib_img = "imageMso=" + quoteattr(imagem_mso)
+
+        # --- ponto de insercao (texto, preservando a formatacao) ---
+        if depois_de is not None:
+            m = re.search(r'<(\w+:)?\w+\b[^>]*?\bid\s*=\s*"%s"[^>]*?/>' % re.escape(depois_de), xml, re.S)
+            if not m:
+                raise ValueError(f"Controle '{depois_de}' (elemento vazio <.../>) nao encontrado na ribbon.")
+            pos = m.end()
+            inicio_linha = xml.rfind("\n", 0, m.start()) + 1
+        else:
+            m = re.search(r'<(\w+:)?group\b[^>]*?\bid\s*=\s*"%s"[^>]*>' % re.escape(grupo), xml, re.S)
+            if not m:
+                raise ValueError(f"Grupo '{grupo}' nao encontrado na ribbon.")
+            fim = re.compile(r"</(\w+:)?group\s*>").search(xml, m.end())
+            pos = xml.rfind("\n", 0, fim.start())
+            pos = fim.start() if pos < m.end() else pos
+            inicio_linha = xml.rfind("\n", 0, m.start()) + 1
+        recuo = re.match(r"[ \t]*", xml[inicio_linha:]).group(0)
+        if depois_de is None:
+            recuo += "\t"
+        prefixo = (m.group(1) or "")
+        linhas = []
+        if separador:
+            n, id_sep = 1, "sep_" + id_botao
+            while id_sep in ids:
+                n += 1
+                id_sep = "sep_%s_%d" % (id_botao, n)
+            linhas.append("%s<%sseparator id=%s/>" % (recuo, prefixo, quoteattr(id_sep)))
+        atribs = ["id=" + quoteattr(id_botao)]
+        if tag is not None:
+            atribs.append("tag=" + quoteattr(tag))
+        atribs += ["label=" + quoteattr(label), "size=" + quoteattr(size),
+                   "onAction=" + quoteattr(on_action)]
+        if atrib_img:
+            atribs.append(atrib_img)
+        linhas.append("%s<%sbutton %s />" % (recuo, prefixo, ("\n" + recuo + "\t\t").join(atribs)))
+        novo_xml = xml[:pos] + "\n\n" + "\n\n".join(linhas) + xml[pos:]
+
+        # --- conferencia antes de gravar ---
+        r2 = ET.fromstring(novo_xml)
+        achados = [e for e in r2.iter() if e.get("id") == id_botao]
+        if len(achados) != 1 or achados[0].get("onAction") != on_action:
+            raise RuntimeError("Conferencia falhou: o botao novo nao ficou unico no XML.")
+        if len([e for e in r2.iter()]) != len([e for e in raiz.iter()]) + len(linhas):
+            raise RuntimeError("Conferencia falhou: a contagem de elementos nao bate.")
+        novos[parte] = novo_xml.encode("utf-8")
+
+        # --- grava (temporario + troca) ---
+        self._garantir_backup()
+        tmp = self.caminho + ".ribbon.tmp"
+        with zipfile.ZipFile(tmp, "w") as zout:
+            for info in infos:
+                zout.writestr(info, novos.pop(info.filename, dados[info.filename]))
+            for nome, conteudo in novos.items():
+                zout.writestr(nome, conteudo, compress_type=zipfile.ZIP_DEFLATED)
+        with zipfile.ZipFile(tmp) as zt:
+            if zt.testzip() is not None:
+                os.remove(tmp)
+                raise RuntimeError("O pacote gravado ficou corrompido; original intacto.")
+        os.replace(tmp, self.caminho)
+        print(f"  [ok] botao '{id_botao}' adicionado a ribbon ({parte}).")
+        return novo_xml
+
+
+def _main_ribbon(args):
+    pr = PacoteRibbon(args.workbook)
+    if args.comando == "ribbon-ler":
+        x = pr.ler_ribbon()
+        print(x if x is not None else "(sem ribbon personalizada)")
+    else:
+        pr.adicionar_botao_ribbon(args.id, args.label, args.on_action, tag=args.tag,
+                                  depois_de=args.depois_de, grupo=args.grupo,
+                                  separador=not args.sem_separador, size=args.size,
+                                  imagem=args.imagem, imagem_mso=args.imagem_mso,
+                                  id_imagem=args.id_imagem)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="Edita os modulos de codigo VBA de um workbook do Excel.")
@@ -2168,11 +2359,31 @@ def main(argv=None):
 
     sub.add_parser("verificar", help="Compila o projeto VBA e informa se ha erro.")
 
+    sub.add_parser("ribbon-ler", help="Imprime o XML da ribbon personalizada (customUI).")
+    sp = sub.add_parser("ribbon-adicionar-botao",
+                        help="Acrescenta um botao a um grupo da ribbon (arquivo fechado; backup).")
+    sp.add_argument("--id", required=True, help="id do botao novo (inedito).")
+    sp.add_argument("--label", required=True)
+    sp.add_argument("--on-action", required=True, help="Callback VBA (Sub x(control As IRibbonControl)).")
+    sp.add_argument("--tag", default=None)
+    sp.add_argument("--depois-de", default=None, help="id do controle apos o qual inserir.")
+    sp.add_argument("--grupo", default=None, help="id do grupo (insere no fim dele).")
+    sp.add_argument("--sem-separador", action="store_true", help="Nao poe <separator> antes.")
+    sp.add_argument("--size", default="large", choices=["large", "normal"])
+    sp.add_argument("--imagem", default=None, help="PNG a embutir como icone.")
+    sp.add_argument("--id-imagem", default=None, help="id da relacao da imagem (padrao img_<id>).")
+    sp.add_argument("--imagem-mso", default=None, help="Icone embutido do Office (imageMso).")
+
     args = p.parse_args(argv)
 
     # Acentos fora do charset do console nao devem derrubar o programa
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
+
+    # A ribbon mora no pacote zip: nao abre o Excel
+    if args.comando.startswith("ribbon-"):
+        _main_ribbon(args)
+        return
 
     # Somente comandos que alteram o projeto salvam o workbook ao fechar.
     # Salvar em comando de leitura reescreveria o arquivo inteiro a toa
